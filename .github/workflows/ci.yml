@@ -1,0 +1,21 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/Convokit-React-Native-SDK
+          path: vendor/react-native-sdk
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - run: npm install --no-save ./vendor/react-native-sdk
+      - run: npm run check:boundaries
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
