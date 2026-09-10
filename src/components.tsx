@@ -1,4 +1,4 @@
-import { useRef, useState, type ReactElement, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactElement, type ReactNode } from 'react'
 import {
   ActivityIndicator, FlatList, Image, Pressable, StyleSheet, Text, TextInput, View,
 } from 'react-native'
@@ -59,8 +59,11 @@ export function ConvoKitConversationListView(props: ConversationListViewProps): 
           <Avatar label={item.displayTitle} imageUrl={item.imageUrl} />
           <View style={styles.flex}>
             <Text numberOfLines={1} style={{ color: theme.colors.text, fontSize: theme.typography.body, fontWeight: '700' }}>{item.displayTitle}</Text>
-            {!!item.description && <Text numberOfLines={1} style={{ color: theme.colors.mutedText }}>{item.description}</Text>}
+            <Text numberOfLines={1} style={{ color: theme.colors.mutedText }}>
+              {item.participants.map(participant => participant.name).join(', ') || item.description}
+            </Text>
           </View>
+          <Text style={{ color: theme.colors.mutedText, fontSize: 22 }}>›</Text>
         </Pressable>}</>
     }}
     ListEmptyComponent={() => <>{props.renderEmpty?.(props.onRefresh ?? (() => undefined)) ??
@@ -93,6 +96,19 @@ export function ConvoKitMessageListView(props: MessageListViewProps): ReactEleme
   const theme = useConvoKitTheme()
   const chronological = [...props.messages]
   const data = props.reverse === false ? chronological : chronological.reverse()
+  const listRef = useRef<FlatList<Message>>(null)
+  const previousNewestId = useRef<string | undefined>(chronological.at(-1)?.id)
+  const newest = chronological.at(-1)
+  useEffect(() => {
+    const previousId = previousNewestId.current
+    previousNewestId.current = newest?.id
+    if (!previousId || !newest || previousId === newest.id || newest.senderId !== props.currentUserId) return
+    const frame = requestAnimationFrame(() => {
+      if (props.reverse === false) listRef.current?.scrollToEnd({ animated: true })
+      else listRef.current?.scrollToOffset({ offset: 0, animated: true })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [newest, props.currentUserId, props.reverse])
   const participants = new Map<string, Participant>()
   for (const participant of props.conversation.participants) {
     participants.set(participant.id, participant); participants.set(participant.appUserId, participant)
@@ -108,6 +124,7 @@ export function ConvoKitMessageListView(props: MessageListViewProps): ReactEleme
     : props.error ? <>{props.renderError?.(props.error, props.onLoadOlder ?? (() => undefined)) ??
       <ErrorState error={props.error} retry={props.onLoadOlder} />}</> : null
   return <FlatList
+    ref={listRef}
     testID={props.testID}
     data={data}
     inverted={props.reverse !== false}
@@ -165,8 +182,12 @@ export function ConvoKitConversationView(props: ConversationViewProps): ReactEle
     {props.renderHeader?.(props.conversation, { ...(props.onBack ? { onBack: props.onBack } : {}), ...(props.onRefresh ? { onRefresh: props.onRefresh } : {}) }) ??
       <View style={[styles.header, { backgroundColor: theme.colors.surface, borderColor: theme.colors.border }]}>
         {!!props.onBack && <Pressable accessibilityRole="button" accessibilityLabel="Back" onPress={props.onBack}><Text style={{ color: theme.colors.primary }}>‹ Back</Text></Pressable>}
-        <Text numberOfLines={1} style={[styles.headerTitle, { color: theme.colors.text }]}>{props.conversation.displayTitle}</Text>
-        {!!props.onRefresh && <Pressable accessibilityRole="button" accessibilityLabel="Refresh conversation" onPress={() => void props.onRefresh?.()}><Text style={{ color: theme.colors.primary }}>Refresh</Text></Pressable>}
+        <Avatar label={props.conversation.displayTitle} imageUrl={props.conversation.imageUrl} />
+        <View style={styles.flex}>
+          <Text numberOfLines={1} style={[styles.headerTitle, { color: theme.colors.text }]}>{props.conversation.displayTitle}</Text>
+          <Text style={{ color: theme.colors.mutedText, fontSize: theme.typography.caption }}>{props.conversation.participants.length} participants</Text>
+        </View>
+        {!!props.onRefresh && <Pressable accessibilityRole="button" accessibilityLabel="Refresh conversation" onPress={() => void props.onRefresh?.()}><Text style={{ color: theme.colors.text, fontSize: 24 }}>↻</Text></Pressable>}
       </View>}
     {!!props.conversationError && <ErrorState error={props.conversationError} retry={props.onRefresh} />}
     <View style={styles.flex}><ConvoKitMessageListView {...props} /></View>
@@ -185,7 +206,14 @@ export function ConvoKitConversationView(props: ConversationViewProps): ReactEle
           onSubmitEditing={() => void send()}
           style={[styles.input, { color: theme.colors.text, borderColor: theme.colors.border }]}
         />
-        <Pressable accessibilityRole="button" accessibilityLabel="Send message" disabled={!value.trim() || props.isSending} onPress={() => void send()}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Send message"
+          disabled={!value.trim() || props.isSending}
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+          onPress={() => void send()}
+          style={styles.sendButton}
+        >
           <Text style={{ color: value.trim() ? theme.colors.primary : theme.colors.mutedText, fontWeight: '700' }}>Send</Text>
         </Pressable>
       </View>}
@@ -220,8 +248,12 @@ function DefaultMedia({ media, onPress }: { media: MessageMedia; onPress(): void
     <Image source={{ uri: media.url }} resizeMode="contain" style={styles.image} accessibilityLabel={media.name ?? 'Image attachment'} />
   </Pressable>
   const label = media.name ?? (media.type === 'location' ? 'Location' : media.type === 'contact' ? 'Contact' : 'File')
+  const size = 'size' in media && media.size ? `${Math.round(media.size / 1024)} KB` : ''
   return <Pressable accessibilityRole="button" accessibilityLabel={label} onPress={onPress} style={[styles.file, { borderColor: theme.colors.border }]}>
-    <Text style={{ color: theme.colors.text }}>▤ {label}</Text>
+    <Text style={{ color: theme.colors.primary, fontSize: 24 }}>▱</Text>
+    <View style={styles.flex}><Text style={{ color: theme.colors.text, fontWeight: '700' }}>{label}</Text>
+      {!!size && <Text style={{ color: theme.colors.mutedText, fontSize: theme.typography.caption }}>{size}</Text>}</View>
+    <Text style={{ color: theme.colors.mutedText, fontSize: 20 }}>⇩</Text>
   </Pressable>
 }
 
@@ -245,8 +277,9 @@ const styles = StyleSheet.create({
   header: { minHeight: 60, borderBottomWidth: StyleSheet.hairlineWidth, paddingHorizontal: 16, flexDirection: 'row', alignItems: 'center', gap: 12 },
   headerTitle: { flex: 1, fontSize: 17, fontWeight: '700' },
   composer: { borderTopWidth: StyleSheet.hairlineWidth, padding: 10, flexDirection: 'row', alignItems: 'flex-end', gap: 10 },
+  sendButton: { minWidth: 72, minHeight: 48, paddingHorizontal: 12, paddingVertical: 12, alignItems: 'center', justifyContent: 'center' },
   input: { flex: 1, maxHeight: 120, minHeight: 42, borderWidth: StyleSheet.hairlineWidth, borderRadius: 18, paddingHorizontal: 12, paddingVertical: 9 },
   bubble: { maxWidth: 520, borderWidth: StyleSheet.hairlineWidth, borderRadius: 18, paddingHorizontal: 13, paddingVertical: 9, gap: 5 },
-  image: { width: 240, height: 180, borderRadius: 10 }, file: { minWidth: 190, borderWidth: StyleSheet.hairlineWidth, borderRadius: 10, padding: 12 },
+  image: { width: 240, height: 180, borderRadius: 10 }, file: { minWidth: 240, borderWidth: StyleSheet.hairlineWidth, borderRadius: 10, padding: 12, flexDirection: 'row', alignItems: 'center', gap: 10 },
   error: { padding: 12, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
 })
