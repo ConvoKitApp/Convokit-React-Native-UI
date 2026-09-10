@@ -5,16 +5,23 @@ on:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - name: Check out React Native SDK
+        uses: actions/checkout@v5
         with:
           repository: ${{ github.repository_owner }}/Convokit-React-Native-SDK
           path: vendor/react-native-sdk
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: actions/setup-node@v5
         with:
           node-version-file: .nvmrc
-      - run: npm install --no-save ./vendor/react-native-sdk
+      - name: Install dependencies
+        run: npm install --no-save --legacy-peer-deps ./vendor/react-native-sdk
+      - name: Build React Native SDK
+        run: npm run build --prefix vendor/react-native-sdk
       - run: npm run check:boundaries
       - run: npm run typecheck
       - run: npm test
