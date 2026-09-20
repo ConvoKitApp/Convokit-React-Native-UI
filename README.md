@@ -27,4 +27,9 @@ opening stay behind application callbacks. This package deliberately imports
 neither Expo modules nor app-specific native libraries, keeping a future
 `react-native-web` target open.
 
+Optimistic rows display `Sending…` until acknowledgement. A confirmed message
+shows its server timestamp, and `Read by N` once other participants have read
+it. ConvoKit does not report recipient delivery, so the default rows never
+claim a delivered state; replace `renderReadReceipt` for custom wording.
+
 Publish `@convokitapp/react-native` before publishing this package.
