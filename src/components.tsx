@@ -2,8 +2,8 @@ import { useEffect, useRef, useState, type ReactElement, type ReactNode } from '
 import {
   ActivityIndicator, FlatList, Image, Pressable, StyleSheet, Text, TextInput, View,
 } from 'react-native'
-import type { Conversation, Message, MessageMedia, Participant } from '@convokitapp/react-native'
-import { isConvoKitPendingMessage } from './conversation-controller'
+import type { Conversation, Message, MessageMedia, Participant, ReadPosition } from '@convokitapp/react-native'
+import { isConvoKitPendingMessage, resolveReaderIds } from './conversation-controller'
 import { useConvoKitTheme } from './theme'
 
 type AsyncAction = () => void | Promise<void>
@@ -80,7 +80,10 @@ export function ConvoKitConversationListView(props: ConversationListViewProps): 
 
 export interface MessageListViewProps {
   conversation: Conversation; messages: readonly Message[]; currentUserId: string
+  /** Acknowledgement times; the fallback when a user has no read position. */
   readAtByUserId?: ReadonlyMap<string, Date>
+  /** Server read positions; a user's position decides which messages they have read. */
+  readPositionByUserId?: ReadonlyMap<string, ReadPosition>
   readersResolver?: (message: Message) => ReadonlySet<string>
   onLoadOlder?: AsyncAction; hasOlderMessages?: boolean; isLoadingOlder?: boolean; error?: unknown
   renderMessage?: (context: MessageRowContext) => ReactNode
@@ -114,10 +117,9 @@ export function ConvoKitMessageListView(props: MessageListViewProps): ReactEleme
     participants.set(participant.id, participant); participants.set(participant.appUserId, participant)
   }
   const readers = (message: Message): ReadonlySet<string> => {
-    if (props.readersResolver) return props.readersResolver(message)
     if (isConvoKitPendingMessage(message)) return new Set()
-    return new Set([...(props.readAtByUserId ?? new Map())].filter(([id, at]) =>
-      id !== message.senderId && at >= message.createdAt).map(([id]) => id))
+    if (props.readersResolver) return props.readersResolver(message)
+    return resolveReaderIds(message, props.readPositionByUserId, props.readAtByUserId)
   }
   const loader = props.isLoadingOlder
     ? <>{props.renderLoadingOlder?.() ?? <ActivityIndicator accessibilityLabel="Loading older messages" />}</>

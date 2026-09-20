@@ -1,5 +1,5 @@
 import type {
-  ConvoKitClient, Conversation, Message, MessageDeletedEvent, MessageEvent,
+  ConvoKitClient, Conversation, MarkConversationReadOptions, Message, MessageDeletedEvent, MessageEvent,
   MessageMedia, ReadEvent, RealtimeConnectionEvent, RealtimeSubscription, TypingEvent,
 } from '@convokitapp/react-native'
 
@@ -16,7 +16,11 @@ export interface ConvoKitUiClient {
   sendMessage(input: {
     conversationId: string; clientMessageId?: string; text?: string; media?: MessageMedia[]
   }): Promise<Message>
-  markConversationRead(id: string): Promise<void>
+  /** Acknowledge through `options.throughMessageId` (the newest rendered message). Adapters that ignore the
+   * target degrade to acknowledging the newest message on the server at request time; a target the server
+   * no longer knows must reject with an error whose `code` is `MESSAGE_NOT_FOUND`.
+   */
+  markConversationRead(id: string, options?: MarkConversationReadOptions): Promise<void>
   sendTyping(input: { conversationId: string; isTyping: boolean }): Promise<void>
   onConnectionEvent(handler: (event: RealtimeConnectionEvent) => void, ended: () => void): RealtimeSubscription
   onInboxChanged(handler: () => void): RealtimeSubscription
@@ -37,7 +41,9 @@ export class DefaultConvoKitUiClient implements ConvoKitUiClient {
   getMessages(input: Parameters<ConvoKitClient['getMessages']>[0]) { return this.sdk.getMessages(input) }
   getMessage(id: string) { return this.sdk.getMessage(id) }
   sendMessage(input: Parameters<ConvoKitClient['sendMessage']>[0]) { return this.sdk.sendMessage(input) }
-  markConversationRead(id: string) { return this.sdk.markConversationRead(id) }
+  markConversationRead(id: string, options?: MarkConversationReadOptions) {
+    return this.sdk.markConversationRead(id, options ?? {})
+  }
   sendTyping(input: { conversationId: string; isTyping: boolean }) { return this.sdk.sendTyping(input) }
   onConnectionEvent(handler: (event: RealtimeConnectionEvent) => void, ended: () => void) {
     return this.sdk.realtime.onConnectionEvent({ onEvent: handler, onSessionEnded: ended })

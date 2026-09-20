@@ -9,7 +9,7 @@ import {
   type ConversationListViewProps, type MessageListViewProps,
 } from './components'
 import type { ConversationFilter, ConversationPageLoader } from './filter'
-import { useControllerState } from './hooks'
+import { useControllerState, useConvoKitVisibility } from './hooks'
 
 export interface ConvoKitConversationListProps extends Omit<ConversationListViewProps,
   'conversations' | 'onLoadMore' | 'isInitialLoading' | 'isLoadingMore' | 'hasMore' | 'error'> {
@@ -49,7 +49,7 @@ export function ConvoKitConversationList(props: ConvoKitConversationListProps): 
 }
 
 export interface ConvoKitConversationProps extends Omit<MessageListViewProps,
-  'conversation' | 'messages' | 'currentUserId' | 'readAtByUserId' | 'onLoadOlder' |
+  'conversation' | 'messages' | 'currentUserId' | 'readAtByUserId' | 'readPositionByUserId' | 'onLoadOlder' |
   'hasOlderMessages' | 'isLoadingOlder' | 'error'> {
   conversationId: string
   sdk?: ConvoKitClient
@@ -79,6 +79,7 @@ export function ConvoKitConversation(props: ConvoKitConversationProps): ReactEle
   }
   const controller = props.controller ?? owned.current!
   const state = useControllerState(controller)
+  useConvoKitVisibility(controller)
   useEffect(() => () => { if (owned.current) void owned.current.dispose() }, [])
   useEffect(() => { if (state.conversation) props.onConversationLoaded?.(state.conversation) }, [state.conversation, props.onConversationLoaded])
   if (!state.conversation) {
@@ -91,6 +92,7 @@ export function ConvoKitConversation(props: ConvoKitConversationProps): ReactEle
     currentUserId={state.currentUserId}
     typingUserIds={state.typingUserIds}
     readAtByUserId={state.readAtByUserId}
+    readPositionByUserId={state.readPositionByUserId}
     isInitialLoading={state.isInitialLoading}
     isLoadingOlder={state.isLoadingOlder}
     isSending={state.isSending}
