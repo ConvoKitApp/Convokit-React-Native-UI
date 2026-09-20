@@ -1,7 +1,15 @@
 {
   "name": "@convokitapp/react-native-ui",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Extensible React Native conversation UI for ConvoKit.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ConvoKitApp/Convokit-React-Native-UI.git"
+  },
+  "homepage": "https://convokit.app/docs/react-native-ui",
+  "bugs": {
+    "url": "https://github.com/ConvoKitApp/Convokit-React-Native-UI/issues"
+  },
   "license": "MIT",
   "type": "module",
   "source": "./src/index.ts",
@@ -22,15 +30,16 @@
       }
     }
   },
-  "files": ["src", "lib", "README.md"],
+  "files": ["src", "lib", "README.md", "CHANGELOG.md"],
   "engines": { "node": ">=22.13.0" },
   "peerDependencies": {
-    "@convokitapp/react-native": ">=0.4.0 <0.5.0",
+    "@convokitapp/react-native": ">=0.5.0 <0.6.0",
     "react": ">=19.2.0",
     "react-native": ">=0.86.0 <0.88.0"
   },
   "devDependencies": {
-    "@convokitapp/react-native": "0.4.0",
+    "@convokitapp/react-native": "0.5.0",
+    "@convokitapp/sdk": "0.5.0",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "react": "^19.2.0",
