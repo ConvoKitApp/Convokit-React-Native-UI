@@ -12,13 +12,15 @@ import type { ConversationFilter, ConversationPageLoader } from './filter'
 import { useControllerState, useConvoKitVisibility } from './hooks'
 
 export interface ConvoKitConversationListProps extends Omit<ConversationListViewProps,
-  'conversations' | 'onLoadMore' | 'isInitialLoading' | 'isLoadingMore' | 'hasMore' | 'error'> {
+  'conversations' | 'summaries' | 'currentUserId' | 'onLoadMore' | 'isInitialLoading' | 'isLoadingMore' | 'hasMore' | 'error'> {
   sdk?: ConvoKitClient
   client?: ConvoKitUiClient
   controller?: ConversationListController
   initialFilter?: ConversationFilter
   pageLoader?: ConversationPageLoader
   pageSize?: number
+  /** Max wait before an `inbox_activity` signal refreshes the list; default 500, 0 refreshes immediately. */
+  activityRefreshWindowMs?: number
 }
 
 export function ConvoKitConversationList(props: ConvoKitConversationListProps): ReactElement {
@@ -31,6 +33,7 @@ export function ConvoKitConversationList(props: ConvoKitConversationListProps): 
       ...(props.initialFilter ? { initialFilter: props.initialFilter } : {}),
       ...(props.pageLoader ? { pageLoader: props.pageLoader } : {}),
       ...(props.pageSize ? { pageSize: props.pageSize } : {}),
+      ...(props.activityRefreshWindowMs === undefined ? {} : { activityRefreshWindowMs: props.activityRefreshWindowMs }),
     })
   }
   const controller = props.controller ?? owned.current!
@@ -39,6 +42,8 @@ export function ConvoKitConversationList(props: ConvoKitConversationListProps): 
   return <ConvoKitConversationListView
     {...props}
     conversations={state.conversations}
+    summaries={state.summaries}
+    currentUserId={state.currentUserId}
     isInitialLoading={state.isInitialLoading}
     isLoadingMore={state.isLoadingMore}
     hasMore={state.hasMore}

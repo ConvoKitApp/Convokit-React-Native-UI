@@ -2,14 +2,22 @@ import { useEffect, useRef, useState, type ReactElement, type ReactNode } from '
 import {
   ActivityIndicator, FlatList, Image, Pressable, StyleSheet, Text, TextInput, View,
 } from 'react-native'
-import type { Conversation, Message, MessageMedia, Participant, ReadPosition } from '@convokitapp/react-native'
+import type { Conversation, InboxSummary, Message, MessageMedia, Participant, ReadPosition } from '@convokitapp/react-native'
 import { isConvoKitPendingMessage, resolveReaderIds } from './conversation-controller'
+import { conversationPreview, unreadBadge } from './inbox'
 import { useConvoKitTheme } from './theme'
 
 type AsyncAction = () => void | Promise<void>
 
+/** Message and inbox times in the device zone. */
+const formatMessageTime = (date: Date): string => date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+
 export interface ConversationRowContext {
   conversation: Conversation; index: number; onPress: () => void
+  /** Present on the inbox path: the row's preview, unread count and read state. */
+  summary?: InboxSummary
+  /** The bound user, when the view was given one; decides the `You: ` preview prefix. */
+  currentUserId?: string
 }
 export interface MessageRowContext {
   message: Message; chronologicalIndex: number; isCurrentUser: boolean;
@@ -19,6 +27,10 @@ export interface MediaContext { media: MessageMedia; message: Message; isCurrent
 
 export interface ConversationListViewProps {
   conversations: readonly Conversation[]
+  /** Inbox summaries by conversation id; rows without one keep the 0.5 participants/description line. */
+  summaries?: ReadonlyMap<string, InboxSummary>
+  /** The bound user; without it no preview gets the `You: ` prefix. */
+  currentUserId?: string
   onConversationSelected(conversation: Conversation): void
   onRefresh?: AsyncAction
   onLoadMore?: AsyncAction
@@ -34,6 +46,16 @@ export interface ConversationListViewProps {
 
 export function ConvoKitConversationListView(props: ConversationListViewProps): ReactElement {
   const theme = useConvoKitTheme()
+  // Pull-to-refresh shows its own spinner only for the pull; background refreshes never move the list.
+  const [pulling, setPulling] = useState(false)
+  const mounted = useRef(true)
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
+  const pull = props.onRefresh ? async () => {
+    setPulling(true)
+    try { await props.onRefresh?.() } finally { if (mounted.current) setPulling(false) }
+  } : undefined
+  // Inline Retry: the next page when one is pending (bypassing the end-reached guard), otherwise a refresh.
+  const retryInline = props.hasMore && props.onLoadMore ? props.onLoadMore : props.onRefresh
   if (props.isInitialLoading && !props.conversations.length) {
     return <>{props.renderLoading?.() ?? <ActivityIndicator accessibilityLabel="Loading conversations" />}</>
   }
@@ -51,31 +73,51 @@ export function ConvoKitConversationListView(props: ConversationListViewProps): 
     ) ?? <View style={{ height: theme.spacing.sm }} />}</>}
     renderItem={({ item, index }) => {
       const onPress = () => props.onConversationSelected(item)
-      return <>{props.renderItem?.({ conversation: item, index, onPress }) ??
-        <Pressable
-          accessibilityRole="button" accessibilityLabel={`Open ${item.displayTitle}`}
-          onPress={onPress} style={[styles.row, { backgroundColor: theme.colors.surface, borderColor: theme.colors.border }]}
-        >
-          <Avatar label={item.displayTitle} imageUrl={item.imageUrl} />
-          <View style={styles.flex}>
-            <Text numberOfLines={1} style={{ color: theme.colors.text, fontSize: theme.typography.body, fontWeight: '700' }}>{item.displayTitle}</Text>
-            <Text numberOfLines={1} style={{ color: theme.colors.mutedText }}>
-              {item.participants.map(participant => participant.name).join(', ') || item.description}
-            </Text>
-          </View>
-          <Text style={{ color: theme.colors.mutedText, fontSize: 22 }}>›</Text>
-        </Pressable>}</>
+      const summary = props.summaries?.get(item.id)
+      const context: ConversationRowContext = {
+        conversation: item, index, onPress,
+        ...(summary ? { summary } : {}),
+        ...(props.currentUserId === undefined ? {} : { currentUserId: props.currentUserId }),
+      }
+      return <>{props.renderItem?.(context) ?? <DefaultConversationRow {...context} />}</>
     }}
     ListEmptyComponent={() => <>{props.renderEmpty?.(props.onRefresh ?? (() => undefined)) ??
       <Text style={[styles.center, { color: theme.colors.mutedText }]}>No conversations</Text>}</>}
     ListFooterComponent={() => props.isLoadingMore
       ? <>{props.renderLoadingMore?.() ?? <ActivityIndicator accessibilityLabel="Loading more conversations" />}</>
-      : props.error ? <ErrorState error={props.error} retry={props.onLoadMore} /> : null}
-    refreshing={Boolean(props.isInitialLoading && props.conversations.length)}
-    onRefresh={props.onRefresh}
+      : props.error ? <ErrorState error={props.error} retry={retryInline} /> : null}
+    refreshing={pulling || Boolean(props.isInitialLoading && props.conversations.length)}
+    onRefresh={pull}
     onEndReachedThreshold={0.35}
     onEndReached={() => { if (props.hasMore && !props.isLoadingMore) void props.onLoadMore?.() }}
   />
+}
+
+function DefaultConversationRow({ conversation, onPress, summary, currentUserId }: ConversationRowContext): ReactElement {
+  const theme = useConvoKitTheme()
+  const preview = summary ? conversationPreview(conversation, summary, currentUserId) : null
+  const badge = summary ? unreadBadge(summary) : null
+  const label = badge ? `Open ${conversation.displayTitle}, ${badge.accessibilityLabel}` : `Open ${conversation.displayTitle}`
+  return <Pressable
+    accessibilityRole="button" accessibilityLabel={label}
+    onPress={onPress} style={[styles.row, { backgroundColor: theme.colors.surface, borderColor: theme.colors.border }]}
+  >
+    <Avatar label={conversation.displayTitle} imageUrl={conversation.imageUrl} />
+    <View style={styles.flex}>
+      <Text numberOfLines={1} style={{ color: theme.colors.text, fontSize: theme.typography.body, fontWeight: badge ? '800' : '700' }}>{conversation.displayTitle}</Text>
+      <Text numberOfLines={1} style={{ color: badge ? theme.colors.text : theme.colors.mutedText }}>
+        {preview ?? (conversation.participants.map(participant => participant.name).join(', ') || conversation.description)}
+      </Text>
+    </View>
+    {summary
+      ? <View style={styles.rowMeta}>
+        <Text style={{ color: theme.colors.mutedText, fontSize: theme.typography.caption }}>{formatMessageTime(summary.activityAt)}</Text>
+        {!!badge && <View accessibilityLabel={badge.accessibilityLabel} style={[styles.badge, { backgroundColor: theme.colors.badge ?? theme.colors.primary }]}>
+          <Text accessibilityElementsHidden importantForAccessibility="no-hide-descendants" style={styles.badgeLabel}>{badge.label}</Text>
+        </View>}
+      </View>
+      : <Text style={{ color: theme.colors.mutedText, fontSize: 22 }}>›</Text>}
+  </Pressable>
 }
 
 export interface MessageListViewProps {
@@ -236,7 +278,7 @@ function DefaultMessageRow(props: MessageRowContext & Pick<MessageListViewProps,
           <DefaultMedia media={media} onPress={() => props.onAttachmentPress?.(props.message, media)} />}
       </View>)}
       <Text style={{ color: props.isCurrentUser ? theme.colors.outgoingText : theme.colors.mutedText, opacity: 0.75, fontSize: theme.typography.caption }}>
-        {pending ? 'Sending…' : props.message.createdAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+        {pending ? 'Sending…' : formatMessageTime(props.message.createdAt)}
       </Text>
     </View>
     {props.isCurrentUser && !pending && props.readerIds.size > 0 && <>{props.renderReadReceipt?.(props.message, props.readerIds) ??
@@ -284,4 +326,7 @@ const styles = StyleSheet.create({
   bubble: { maxWidth: 520, borderWidth: StyleSheet.hairlineWidth, borderRadius: 18, paddingHorizontal: 13, paddingVertical: 9, gap: 5 },
   image: { width: 240, height: 180, borderRadius: 10 }, file: { minWidth: 240, borderWidth: StyleSheet.hairlineWidth, borderRadius: 10, padding: 12, flexDirection: 'row', alignItems: 'center', gap: 10 },
   error: { padding: 12, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  rowMeta: { alignItems: 'flex-end', gap: 4 },
+  badge: { minWidth: 20, height: 20, borderRadius: 10, paddingHorizontal: 6, alignItems: 'center', justifyContent: 'center' },
+  badgeLabel: { color: '#fff', fontSize: 11, fontWeight: '700' },
 })

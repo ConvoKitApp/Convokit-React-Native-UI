@@ -71,5 +71,72 @@ Mixed fleet: precise receipts need the sender and the reader on 0.5 with the
 backend read-position migration; 0.4 receivers keep timestamp semantics but
 keep parsing the additive payload.
 
-Version 0.5.0 requires `@convokitapp/react-native` 0.5.x. Publish
+## Inbox previews and unread counts
+
+`ConvoKitConversationList` and `useConvoKitConversationList` page the inbox
+(`listInbox`, cursor-based) whenever the adapter exposes it and no custom
+`pageLoader` is set. `ConversationListState` then carries `summaries`, a map
+from conversation id to `InboxSummary` (`latestMessage`, `unreadCount`,
+`unreadCountCapped`, `readPosition`, `lastReadAt`, `activityAt`), and
+`currentUserId`, the bound user (`''` without a session, on the legacy path
+and after `dispose`). `isRefreshing` reports a background walk.
+`conversations`, filters, comparators, custom offset `pageLoader`s and the
+existing renderer signatures are unchanged.
+
+Ordering follows the server: `activityAt` descending, then id descending.
+Pages are merged by conversation id, a later entry replaces an earlier one (a
+room that moved keeps its newest summary), and the activity order is re-applied
+whenever pages are combined, on `loadMore` and on `refresh`. Setting
+`filter.comparator` replaces that order; `Conversation.updatedAt` is never an
+ordering input. `refresh()` walks from the head in pages of at most 100 until
+the loaded window is covered and something is visible, then swaps rows,
+summaries and the cursor atomically, so it never publishes an empty list with
+`hasMore` while more pages exist. Cursor pages may legitimately repeat loaded
+ids; only a cursor that does not advance is an error. `mergeInboxEntries` and
+`compareInboxActivity` implement the rule for custom stores.
+
+Live updates: the list subscribes to `onInboxChanged` (structural changes and
+deletions, refetched immediately) and `onInboxActivity` (message inserts and
+edits, read-position advances). Activity is throttled by
+`activityRefreshWindowMs` (default `500`): the first signal starts the window,
+later signals ride along, and one refresh runs when it fires; `0` refreshes
+immediately. `inbox_changed`, a manual `refresh()` and a rejoin stay immediate
+and drop a pending activity timer. Room controllers keep subscribing to
+`onInboxChanged` only.
+
+Default rows replace the participants/description line with a one-line preview
+when the summary has a latest message with a body: `You: hi` for the caller's
+own message (DMs included), `Ana: hi` for a listed, named sender in rooms with
+more than two participants, plain `hi` otherwise (DMs, departed or unnamed
+senders). Media-only messages read `Photo`, the file name or `File`,
+`Location` and `Contact`; a room without a body keeps today's line. The
+activity time is shown in the device zone. An unread badge renders while
+`unreadCount > 0` or the count is capped: the visible label is the count, or
+`99+` above 99 and when the server capped it at 1,000; the accessible name is
+`<count> unread` (`99+ unread` when capped) and the visible label is hidden
+from the accessibility tree. The row's own accessible name appends
+`, <count> unread`. Unread titles use the heavier weight. The badge colour is
+the new theme token `colors.badge` (unset means `primary`).
+
+Custom rows receive the additive `summary` and `currentUserId` on
+`ConversationRowContext`; `conversationPreview(conversation, summary,
+currentUserId)` and `unreadBadge(summary)` return the default strings. The
+controlled `ConvoKitConversationListView` accepts `summaries` and
+`currentUserId` (absent means today's rows and no `You:` prefix).
+Pull-to-refresh is driven by the pull itself, never by background refreshes.
+The inline error `Retry` requests the next page when `hasMore` and
+`onLoadMore` are set, otherwise it calls `onRefresh`, and renders only when
+one of those exists.
+
+Custom `ConvoKitUiClient` adapters may implement the optional
+`listInbox({ limit, cursor, archived })` and `onInboxActivity(handler)`;
+`DefaultConvoKitUiClient` does. An adapter without `listInbox`, or a custom
+`pageLoader`, uses `getConversations` with `summaries` empty. A 404 from
+`listInbox` (the route is absent on a rolled-back backend) marks the inbox
+unavailable for that store, clears `summaries`, warns once and re-runs the
+same operation through `getConversations` without evicting rows; 401/403 from
+either endpoint and 404 from the legacy endpoint evict the rows, 400 keeps
+them and sets `error`.
+
+Version 0.6.0 requires `@convokitapp/react-native` 0.6.x. Publish
 `@convokitapp/react-native` before publishing this package.

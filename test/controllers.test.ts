@@ -1,9 +1,12 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
-  Conversation, Message, MessageDeletedEvent, MessageEvent, Participant, ReadEvent, ReadPosition, RealtimeSubscription,
+  Conversation, InboxEntry, InboxPage, InboxSummary, Message, MessageDeletedEvent, MessageEvent, Participant,
+  ReadEvent, ReadPosition, RealtimeSubscription,
 } from '@convokitapp/react-native'
 import { ConversationController } from '../src/conversation-controller'
+import { ConversationListController } from '../src/conversation-list-controller'
 import { filterConversations } from '../src/filter'
+import { mergeInboxEntries } from '../src/inbox'
 import type { ConvoKitUiClient } from '../src/client'
 
 // The React Native entry installs runtime polyfills, so the tests mock it with the shared
@@ -388,6 +391,514 @@ describe('acknowledgements', () => {
     await controller.loadInitial()
     expect(targets()).toEqual(['m1'])
     expect(controller.getSnapshot().error).toBe(failure)
+    await controller.dispose()
+  })
+})
+
+const room = (id: string, overrides: Partial<Conversation> = {}): Conversation => ({
+  ...conversation, id, title: id, displayTitle: id, ...overrides,
+})
+const summary = (activityAt: Date, overrides: Partial<InboxSummary> = {}): InboxSummary => ({
+  latestMessage: null, unreadCount: 0, unreadCountCapped: false, readPosition: null, lastReadAt: null, activityAt, ...overrides,
+})
+const entry = (id: string, seconds: number, overrides: Partial<InboxSummary> = {}): InboxEntry => ({
+  conversation: room(id), ...summary(at(seconds), overrides),
+})
+const page = (entries: InboxEntry[], nextCursor: string | null = null): InboxPage => ({ entries, nextCursor })
+type InboxRequest = { limit: number; cursor: string | null; archived: boolean }
+const status = (code: number) => Object.assign(new Error(`HTTP ${code}`), { status: code })
+
+function listClient(options: { inbox?: boolean } = {}) {
+  const session = {}
+  const signals: { activity?: () => void; changed?: () => void; ended?: () => void } = {}
+  const sdk: ConvoKitUiClient = {
+    currentUserId: 'me', sessionIdentity: session,
+    getConversations: vi.fn().mockResolvedValue([]),
+    ...(options.inbox === false ? {} : { listInbox: vi.fn().mockResolvedValue(page([])) }),
+    getConversation: vi.fn(), getMessages: vi.fn(), getMessage: vi.fn(), sendMessage: vi.fn(),
+    markConversationRead: vi.fn().mockResolvedValue(undefined), sendTyping: vi.fn().mockResolvedValue(undefined),
+    onConnectionEvent: vi.fn((_, ended) => { signals.ended = ended; return close() }),
+    onInboxChanged: vi.fn(handler => { signals.changed = handler; return close() }),
+    onInboxActivity: vi.fn(handler => { signals.activity = handler; return close() }),
+    onMessage: vi.fn(close), onMessageDeleted: vi.fn(close), onReadReceipt: vi.fn(close), onTyping: vi.fn(close),
+  }
+  const inbox = (script: (input: InboxRequest) => InboxPage | Promise<InboxPage>) =>
+    vi.mocked(sdk.listInbox!).mockImplementation(input => Promise.resolve(script(input)))
+  const requests = (): InboxRequest[] => vi.mocked(sdk.listInbox!).mock.calls.map(([input]) => input)
+  /** Head walks after the initial load: each refresh starts at the null cursor. */
+  const walks = () => requests().filter(input => input.cursor === null).length - 1
+  return { sdk, signals, inbox, requests, walks }
+}
+
+describe('ConversationListController', () => {
+  const list = (sdk: ConvoKitUiClient, options: Partial<ConstructorParameters<typeof ConversationListController>[0]> = {}) =>
+    new ConversationListController({ client: sdk, autoLoad: false, pageSize: 2, ...options })
+  const ids = (controller: ConversationListController) => controller.getSnapshot().conversations.map(row => row.id)
+
+  it('loads inbox pages by cursor with summaries and the bound user', async () => {
+    const { sdk, inbox, requests } = listClient()
+    inbox(({ cursor }) => cursor === null
+      ? page([entry('a', 50, { unreadCount: 2 }), entry('b', 40)], 'c1')
+      : page([entry('c', 30)]))
+    const controller = list(sdk)
+    await controller.loadInitial()
+    expect(requests()).toEqual([{ limit: 2, cursor: null, archived: false }])
+    expect(ids(controller)).toEqual(['a', 'b'])
+    expect(controller.getSnapshot().summaries.get('a')?.unreadCount).toBe(2)
+    expect(controller.getSnapshot()).toMatchObject({ hasMore: true, hasLoaded: true, currentUserId: 'me', error: null, isRefreshing: false })
+    await controller.loadMore()
+    expect(requests()[1]).toEqual({ limit: 2, cursor: 'c1', archived: false })
+    expect(ids(controller)).toEqual(['a', 'b', 'c'])
+    expect(controller.getSnapshot().hasMore).toBe(false)
+    expect(sdk.getConversations).not.toHaveBeenCalled()
+    expect(sdk.onInboxActivity).toHaveBeenCalledTimes(1)
+    await controller.dispose()
+    expect(controller.getSnapshot().currentUserId).toBe('')
+  })
+
+  it('lets a later entry win for a room that moved and re-sorts by activity then id', async () => {
+    const { sdk, inbox } = listClient()
+    inbox(({ cursor }) => cursor === null
+      ? page([entry('a', 50), entry('b', 40)], 'c1')
+      : page([entry('c', 30), entry('b', 20, { unreadCount: 1 })]))
+    const controller = list(sdk)
+    await controller.loadInitial()
+    await controller.loadMore()
+    expect(ids(controller)).toEqual(['a', 'c', 'b'])
+    expect(controller.getSnapshot().summaries.get('b')).toMatchObject({ activityAt: at(20), unreadCount: 1 })
+    expect(controller.getSnapshot().error).toBeNull()
+    const tie = mergeInboxEntries([], new Map(), [entry('x', 10), entry('z', 10), entry('y', 10)])
+    expect(tie.conversations.map(row => row.id)).toEqual(['z', 'y', 'x'])
+    await controller.dispose()
+  })
+
+  it('merges a full page of already-loaded ids in place when the cursor advanced', async () => {
+    const { sdk, inbox, requests } = listClient()
+    inbox(({ cursor }) => cursor === null ? page([entry('a', 50), entry('b', 40)], 'c1')
+      : cursor === 'c1' ? page([entry('a', 50), entry('b', 40)], 'c2') : page([]))
+    const controller = list(sdk)
+    await controller.loadInitial()
+    await controller.loadMore()
+    expect(requests().map(input => input.cursor)).toEqual([null, 'c1', 'c2'])
+    expect(ids(controller)).toEqual(['a', 'b'])
+    expect(controller.getSnapshot()).toMatchObject({ hasMore: false, error: null })
+    await controller.dispose()
+  })
+
+  it('rejects a page whose cursor did not advance and keeps the loaded rows', async () => {
+    const { sdk, inbox } = listClient()
+    inbox(({ cursor }) => cursor === null ? page([entry('a', 50)], 'c1') : page([entry('b', 40)], 'c1'))
+    const controller = list(sdk)
+    await controller.loadInitial()
+    await controller.loadMore()
+    expect(controller.getSnapshot().error).toEqual(new Error('Inbox pagination did not advance'))
+    expect(ids(controller)).toEqual(['a'])
+    const { sdk: emptySdk, inbox: emptyInbox } = listClient()
+    emptyInbox(() => page([], 'c1'))
+    const empty = list(emptySdk)
+    await empty.loadInitial()
+    expect(empty.getSnapshot().error).toEqual(new Error('Inbox pagination did not advance'))
+    await controller.dispose(); await empty.dispose()
+  })
+
+  it('refreshes the loaded window from the head in pages of at most 100', async () => {
+    const { sdk, inbox, requests } = listClient()
+    const rows = Array.from({ length: 130 }, (_, index) => entry(`r${String(index).padStart(3, '0')}`, 5000 - index))
+    inbox(({ cursor, limit }) => {
+      const start = cursor === null ? 0 : Number(cursor.slice(2))
+      const end = Math.min(rows.length, start + limit)
+      return page(rows.slice(start, end), end < rows.length ? `k:${end}` : null)
+    })
+    const controller = list(sdk, { pageSize: 50 })
+    await controller.loadInitial(); await controller.loadMore(); await controller.loadMore()
+    expect(ids(controller)).toHaveLength(130)
+    expect(controller.getSnapshot().hasMore).toBe(false)
+    const before = requests().length
+    await controller.refresh()
+    expect(requests().slice(before)).toEqual([
+      { limit: 100, cursor: null, archived: false }, { limit: 30, cursor: 'k:100', archived: false },
+    ])
+    expect(ids(controller)).toHaveLength(130)
+    expect(ids(controller)[0]).toBe('r000')
+    expect(controller.getSnapshot()).toMatchObject({ hasMore: false, error: null, isRefreshing: false })
+    await controller.dispose()
+  })
+
+  it('continues a refresh past a fully hidden head page and keeps the walk cursor', async () => {
+    const { sdk, inbox, requests } = listClient()
+    let refreshed = false
+    inbox(({ cursor }) => {
+      if (!refreshed) return page([entry('a', 50), entry('b', 40)], 'c1')
+      return cursor === null ? page([entry('h1', 90), entry('h2', 80)], 'r1')
+        : cursor === 'r1' ? page([entry('a', 50), entry('b', 40)], 'r2') : page([entry('c', 30)])
+    })
+    const controller = list(sdk, { initialFilter: { predicate: row => !row.id.startsWith('h') } })
+    await controller.loadInitial()
+    expect(ids(controller)).toEqual(['a', 'b'])
+    refreshed = true
+    await controller.refresh()
+    expect(requests().slice(1)).toEqual([{ limit: 2, cursor: null, archived: false }, { limit: 2, cursor: 'r1', archived: false }])
+    expect(ids(controller)).toEqual(['a', 'b'])
+    expect(controller.getSnapshot().hasMore).toBe(true)
+    await controller.loadMore()
+    expect(requests().at(-1)).toEqual({ limit: 2, cursor: 'r2', archived: false })
+    expect(ids(controller)).toEqual(['a', 'b', 'c'])
+    await controller.dispose()
+  })
+
+  it('publishes an empty list with hasMore false once every hidden page is exhausted', async () => {
+    const { sdk, inbox } = listClient()
+    let refreshed = false
+    inbox(({ cursor }) => {
+      if (!refreshed) return page([entry('a', 50), entry('b', 40)], 'c1')
+      return cursor === null ? page([entry('h1', 90), entry('h2', 80)], 'r1') : page([entry('h3', 70)])
+    })
+    const controller = list(sdk, { initialFilter: { predicate: row => !row.id.startsWith('h') } })
+    await controller.loadInitial()
+    refreshed = true
+    await controller.refresh()
+    expect(controller.getSnapshot()).toMatchObject({ conversations: [], hasMore: false, error: null })
+    expect(controller.getSnapshot().summaries.size).toBe(3)
+    await controller.dispose()
+  })
+
+  it('runs a refresh requested during a load afterwards and reports isRefreshing', async () => {
+    const { sdk, inbox, requests } = listClient()
+    const initial = deferred<InboxPage>()
+    let calls = 0
+    inbox(() => (++calls === 1 ? initial.promise : page([entry('a', 50)])))
+    const controller = list(sdk)
+    const load = controller.loadInitial()
+    await flush()
+    await controller.refresh()
+    expect(requests()).toHaveLength(1)
+    initial.resolve(page([entry('a', 50)]))
+    await load; await flush()
+    expect(requests()).toHaveLength(2)
+    const walk = deferred<InboxPage>()
+    inbox(() => walk.promise)
+    const refreshing = controller.refresh()
+    expect(controller.getSnapshot().isRefreshing).toBe(true)
+    await controller.refresh()
+    expect(requests()).toHaveLength(3)
+    walk.resolve(page([entry('a', 50)]))
+    await refreshing; await flush()
+    expect(controller.getSnapshot().isRefreshing).toBe(false)
+    expect(requests()).toHaveLength(4)
+    await controller.dispose()
+  })
+
+  it('runs one head walk after a loadMore for a signal and a refresh requested during it', async () => {
+    const { sdk, signals, inbox, requests } = listClient()
+    const more = deferred<InboxPage>()
+    inbox(({ cursor }) => (cursor === null ? page([entry('a', 50)], 'c1') : more.promise))
+    const controller = list(sdk)
+    await controller.loadInitial()
+    const loading = controller.loadMore()
+    await flush()
+    expect(controller.getSnapshot().isLoadingMore).toBe(true)
+    signals.changed!()
+    await controller.refresh()
+    expect(requests()).toHaveLength(2)
+    more.resolve(page([entry('b', 40)]))
+    await loading; await flush()
+    expect(requests().slice(2)).toEqual([{ limit: 2, cursor: null, archived: false }, { limit: 1, cursor: 'c1', archived: false }])
+    expect(ids(controller)).toEqual(['a', 'b'])
+    expect(controller.getSnapshot()).toMatchObject({ isLoadingMore: false, isRefreshing: false, hasMore: false, error: null })
+    await controller.dispose()
+  })
+
+  it('runs a loadMore requested during a refresh after the walk from the new cursor', async () => {
+    const { sdk, inbox, requests } = listClient()
+    const walk = deferred<InboxPage>()
+    let refreshed = false
+    inbox(({ cursor }) => {
+      if (!refreshed) return page([entry('a', 50), entry('b', 40)], 'c1')
+      return cursor === null ? walk.promise : page([entry('c', 30)])
+    })
+    const controller = list(sdk)
+    await controller.loadInitial()
+    refreshed = true
+    const refreshing = controller.refresh()
+    await flush()
+    expect(controller.getSnapshot().isRefreshing).toBe(true)
+    await controller.loadMore()
+    expect(requests()).toHaveLength(2)
+    walk.resolve(page([entry('n', 60), entry('a', 50)], 'r1'))
+    await refreshing; await flush()
+    expect(requests().slice(2)).toEqual([{ limit: 2, cursor: 'r1', archived: false }])
+    expect(ids(controller)).toEqual(['n', 'a', 'c'])
+    expect(controller.getSnapshot()).toMatchObject({ isLoadingMore: false, isRefreshing: false, hasMore: false, error: null })
+    await controller.dispose()
+  })
+
+  describe('activity throttle', () => {
+    beforeEach(() => { vi.useFakeTimers() })
+    afterEach(() => { vi.useRealTimers() })
+
+    it('coalesces a burst into one walk at the end of the window', async () => {
+      const { sdk, signals, walks } = listClient()
+      const controller = list(sdk)
+      await controller.loadInitial()
+      for (let index = 0; index < 50; index++) { signals.activity!(); await vi.advanceTimersByTimeAsync(2) }
+      expect(walks()).toBe(0)
+      await vi.advanceTimersByTimeAsync(399)
+      expect(walks()).toBe(0)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(walks()).toBe(1)
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(walks()).toBe(1)
+      await controller.dispose()
+    })
+
+    it('keeps at most one walk per window under continuous activity', async () => {
+      const { sdk, signals, walks } = listClient()
+      const controller = list(sdk)
+      await controller.loadInitial()
+      for (let elapsed = 0; elapsed < 3000; elapsed += 50) { signals.activity!(); await vi.advanceTimersByTimeAsync(50) }
+      expect(walks()).toBeGreaterThanOrEqual(5)
+      expect(walks()).toBeLessThanOrEqual(7)
+      await controller.dispose()
+    })
+
+    it('runs exactly one more walk for a signal during a walk', async () => {
+      const { sdk, signals, inbox, walks } = listClient()
+      const gate = deferred<InboxPage>()
+      let calls = 0
+      inbox(() => (++calls === 2 ? gate.promise : page([])))
+      const controller = list(sdk)
+      await controller.loadInitial()
+      signals.activity!()
+      await vi.advanceTimersByTimeAsync(500)
+      expect(walks()).toBe(1)
+      expect(controller.getSnapshot().isRefreshing).toBe(true)
+      signals.activity!(); signals.activity!()
+      await vi.advanceTimersByTimeAsync(500)
+      expect(walks()).toBe(1)
+      gate.resolve(page([]))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(walks()).toBe(2)
+      await vi.advanceTimersByTimeAsync(3000)
+      expect(walks()).toBe(2)
+      await controller.dispose()
+    })
+
+    it('lets inbox_changed refresh immediately and drops the pending activity timer', async () => {
+      const { sdk, signals, walks } = listClient()
+      const controller = list(sdk)
+      await controller.loadInitial()
+      signals.activity!()
+      await vi.advanceTimersByTimeAsync(100)
+      signals.changed!()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(walks()).toBe(1)
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(walks()).toBe(1)
+      await controller.dispose()
+    })
+
+    it('lets a manual refresh drop the pending activity timer', async () => {
+      const { sdk, signals, walks } = listClient()
+      const controller = list(sdk)
+      await controller.loadInitial()
+      signals.activity!()
+      await vi.advanceTimersByTimeAsync(100)
+      await controller.refresh()
+      expect(walks()).toBe(1)
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(walks()).toBe(1)
+      await controller.dispose()
+    })
+
+    it('drops the window on dispose', async () => {
+      const { sdk, signals, walks } = listClient()
+      const controller = list(sdk)
+      await controller.loadInitial()
+      signals.activity!()
+      await vi.advanceTimersByTimeAsync(100)
+      await controller.dispose()
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(walks()).toBe(0)
+    })
+
+    it('refreshes immediately with a zero window', async () => {
+      const { sdk, signals, walks } = listClient()
+      const controller = list(sdk, { activityRefreshWindowMs: 0 })
+      await controller.loadInitial()
+      signals.activity!()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(walks()).toBe(1)
+      await controller.dispose()
+    })
+  })
+
+  it('uses the legacy path with a custom page loader and publishes no summaries', async () => {
+    const { sdk } = listClient()
+    const pageLoader = vi.fn(async () => [room('legacy')])
+    const controller = list(sdk, { pageLoader })
+    await controller.loadInitial()
+    expect(pageLoader).toHaveBeenCalledWith({ limit: 2, offset: 0, filter: {} })
+    expect(sdk.listInbox).not.toHaveBeenCalled()
+    expect(ids(controller)).toEqual(['legacy'])
+    expect(controller.getSnapshot()).toMatchObject({ currentUserId: '' })
+    expect(controller.getSnapshot().summaries.size).toBe(0)
+    await controller.dispose()
+  })
+
+  it('uses getConversations for an adapter without listInbox', async () => {
+    const { sdk } = listClient({ inbox: false })
+    vi.mocked(sdk.getConversations).mockResolvedValue([room('legacy')])
+    const controller = list(sdk)
+    await controller.loadInitial()
+    expect(sdk.getConversations).toHaveBeenCalledWith({ limit: 2, offset: 0, archived: false })
+    expect(ids(controller)).toEqual(['legacy'])
+    expect(controller.getSnapshot()).toMatchObject({ currentUserId: '' })
+    expect(controller.getSnapshot().summaries.size).toBe(0)
+    await controller.dispose()
+  })
+
+  it('falls back to getConversations after a 404 from listInbox and stays there', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const { sdk, inbox } = listClient()
+    inbox(() => Promise.reject(status(404)))
+    vi.mocked(sdk.getConversations).mockImplementation(async ({ offset }) => offset === 0 ? [room('x'), room('y')] : [])
+    const controller = list(sdk)
+    await controller.loadInitial()
+    expect(ids(controller)).toEqual(['x', 'y'])
+    expect(controller.getSnapshot()).toMatchObject({ error: null, hasMore: true, currentUserId: '' })
+    await controller.refresh()
+    await controller.loadMore()
+    expect(sdk.listInbox).toHaveBeenCalledTimes(1)
+    expect(ids(controller)).toEqual(['x', 'y'])
+    expect(controller.getSnapshot().error).toBeNull()
+    expect(warn).toHaveBeenCalledTimes(1)
+    warn.mockRestore()
+    await controller.dispose()
+  })
+
+  it('keeps the loaded rows when the inbox endpoint disappears mid-session', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const { sdk, inbox } = listClient()
+    inbox(() => page([entry('a', 50), entry('b', 40)], 'c1'))
+    vi.mocked(sdk.getConversations).mockImplementation(async ({ offset }) => offset === 0 ? [room('a'), room('b')] : [])
+    const controller = list(sdk)
+    await controller.loadInitial()
+    inbox(() => Promise.reject(status(404)))
+    await controller.refresh()
+    expect(ids(controller)).toEqual(['a', 'b'])
+    expect(controller.getSnapshot().error).toBeNull()
+    expect(controller.getSnapshot().summaries.size).toBe(0)
+    expect(sdk.getConversations).toHaveBeenCalledWith({ limit: 2, offset: 0, archived: false })
+    expect(sdk.listInbox).toHaveBeenCalledTimes(2)
+    vi.mocked(console.warn).mockRestore()
+    await controller.dispose()
+  })
+
+  it('continues a loadMore from the loaded count after a 404 and probes the inbox again on the next loadInitial', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const { sdk, inbox, requests } = listClient()
+    inbox(({ cursor }) => (cursor === null ? page([entry('a', 50), entry('b', 40)], 'c1') : Promise.reject(status(404))))
+    vi.mocked(sdk.getConversations).mockImplementation(async ({ offset }) =>
+      offset === 0 ? [room('a'), room('b')] : offset === 2 ? [room('c')] : [])
+    const controller = list(sdk)
+    await controller.loadInitial()
+    await controller.loadMore()
+    expect(sdk.getConversations).toHaveBeenCalledTimes(1)
+    expect(sdk.getConversations).toHaveBeenCalledWith({ limit: 2, offset: 2, archived: false })
+    expect(ids(controller)).toEqual(['a', 'b', 'c'])
+    expect(controller.getSnapshot()).toMatchObject({ hasMore: false, error: null, currentUserId: '' })
+    expect(controller.getSnapshot().summaries.size).toBe(0)
+    await controller.loadInitial()
+    expect(requests()).toHaveLength(3)
+    expect(ids(controller)).toEqual(['a', 'b'])
+    expect(controller.getSnapshot()).toMatchObject({ hasMore: true, error: null, currentUserId: 'me' })
+    expect(controller.getSnapshot().summaries.size).toBe(2)
+    inbox(() => Promise.reject(status(404)))
+    await controller.loadInitial()
+    expect(requests()).toHaveLength(4)
+    expect(sdk.getConversations).toHaveBeenLastCalledWith({ limit: 2, offset: 0, archived: false })
+    expect(ids(controller)).toEqual(['a', 'b'])
+    expect(controller.getSnapshot()).toMatchObject({ error: null, currentUserId: '' })
+    expect(warn).toHaveBeenCalledTimes(1)
+    warn.mockRestore()
+    await controller.dispose()
+  })
+
+  it('evicts rows on a legacy 404 and on an inbox 401, keeps them on a 400', async () => {
+    const { sdk: legacySdk } = listClient({ inbox: false })
+    vi.mocked(legacySdk.getConversations).mockResolvedValue([room('a')])
+    const legacy = list(legacySdk)
+    await legacy.loadInitial()
+    vi.mocked(legacySdk.getConversations).mockRejectedValue(status(404))
+    await legacy.refresh()
+    expect(legacy.getSnapshot()).toMatchObject({ conversations: [], hasMore: false })
+    expect(legacy.getSnapshot().error).toEqual(status(404))
+
+    const { sdk, inbox } = listClient()
+    inbox(() => page([entry('a', 50)]))
+    const controller = list(sdk)
+    await controller.loadInitial()
+    inbox(() => Promise.reject(status(400)))
+    await controller.refresh()
+    expect(ids(controller)).toEqual(['a'])
+    expect(controller.getSnapshot().error).toEqual(status(400))
+    inbox(() => Promise.reject(status(401)))
+    await controller.refresh()
+    expect(controller.getSnapshot()).toMatchObject({ conversations: [], hasMore: false })
+    expect(controller.getSnapshot().summaries.size).toBe(0)
+    expect(controller.getSnapshot().error).toEqual(status(401))
+    await legacy.dispose(); await controller.dispose()
+  })
+
+  it('retires on session end, ignores later signals and recovers on the next loadInitial', async () => {
+    const { sdk, signals, inbox, walks, requests } = listClient()
+    inbox(() => page([entry('a', 50)]))
+    const controller = list(sdk, { activityRefreshWindowMs: 0 })
+    await controller.loadInitial()
+    signals.ended!()
+    expect(controller.getSnapshot()).toMatchObject({ conversations: [], hasMore: false, currentUserId: '', isInitialLoading: false })
+    expect(controller.getSnapshot().error).toEqual(new Error('ConvoKit session ended'))
+    signals.activity!(); signals.changed!()
+    await controller.refresh(); await flush()
+    expect(walks()).toBe(0)
+    Object.assign(sdk, { sessionIdentity: {} })
+    await controller.loadInitial()
+    expect(requests()).toHaveLength(2)
+    expect(ids(controller)).toEqual(['a'])
+    expect(controller.getSnapshot()).toMatchObject({ currentUserId: 'me', error: null, hasLoaded: true, isInitialLoading: false })
+    signals.changed!(); await flush()
+    expect(requests()).toHaveLength(3)
+    await controller.dispose()
+  })
+
+  it('clears the busy flags and the queued refresh when the session ends mid-load', async () => {
+    const { sdk, signals, inbox, requests } = listClient()
+    const gate = deferred<InboxPage>()
+    inbox(({ cursor }) => (cursor === null ? page([entry('a', 50)], 'c1') : gate.promise))
+    const controller = list(sdk)
+    await controller.loadInitial()
+    const loading = controller.loadMore()
+    await flush()
+    await controller.refresh()
+    expect(controller.getSnapshot()).toMatchObject({ isLoadingMore: true, isRefreshing: false })
+    signals.ended!()
+    expect(controller.getSnapshot()).toMatchObject({ conversations: [], isLoadingMore: false, isRefreshing: false, hasMore: false })
+    gate.resolve(page([entry('b', 40)]))
+    await loading; await flush()
+    expect(requests()).toHaveLength(2)
+    expect(controller.getSnapshot()).toMatchObject({ conversations: [], isLoadingMore: false, isRefreshing: false })
+    expect(controller.getSnapshot().error).toEqual(new Error('ConvoKit session ended'))
+    await controller.dispose()
+  })
+
+  it('lets filter.comparator win over activity order', async () => {
+    const { sdk, inbox } = listClient()
+    inbox(() => page([entry('b', 50), entry('a', 40)]))
+    const controller = list(sdk, { initialFilter: { comparator: (left, right) => left.id.localeCompare(right.id) } })
+    await controller.loadInitial()
+    expect(ids(controller)).toEqual(['a', 'b'])
+    await controller.setFilter({})
+    expect(ids(controller)).toEqual(['b', 'a'])
     await controller.dispose()
   })
 })

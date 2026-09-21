@@ -4,7 +4,9 @@ export interface ConvoKitUiTheme {
   colors: {
     background: string; surface: string; primary: string; text: string; mutedText: string;
     border: string; error: string; incomingBubble: string; outgoingBubble: string;
-    outgoingText: string; pending: string
+    outgoingText: string; pending: string;
+    /** Unread badge background on inbox rows; unset means `primary`, so a re-themed accent carries over. */
+    badge?: string
   }
   spacing: { xs: number; sm: number; md: number; lg: number; xl: number }
   radius: { sm: number; md: number; lg: number; avatar: number }

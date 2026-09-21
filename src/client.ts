@@ -1,5 +1,5 @@
 import type {
-  ConvoKitClient, Conversation, MarkConversationReadOptions, Message, MessageDeletedEvent, MessageEvent,
+  ConvoKitClient, Conversation, InboxPage, MarkConversationReadOptions, Message, MessageDeletedEvent, MessageEvent,
   MessageMedia, ReadEvent, RealtimeConnectionEvent, RealtimeSubscription, TypingEvent,
 } from '@convokitapp/react-native'
 
@@ -7,6 +7,13 @@ export interface ConvoKitUiClient {
   readonly currentUserId: string
   readonly sessionIdentity: object | null
   getConversations(input: { limit: number; offset: number; archived: boolean }): Promise<Conversation[]>
+  /** The 0.6 inbox: rooms in activity order with a preview and unread count per row, paged by cursor.
+   * Optional so 0.5 adapters keep compiling; a list without it (or with a custom `pageLoader`) uses
+   * `getConversations` and publishes no summaries. A 404 marks the endpoint unavailable for the store.
+   */
+  listInbox?(options: { limit: number; cursor: string | null; archived: boolean }): Promise<InboxPage>
+  /** Message inserts/edits and read-position advances in the caller's rooms; never fires on join. */
+  onInboxActivity?(handler: () => void): RealtimeSubscription
   getConversation(id: string): Promise<Conversation>
   getMessages(input: {
     conversationId: string; limit: number; offset?: number;
@@ -37,6 +44,7 @@ export class DefaultConvoKitUiClient implements ConvoKitUiClient {
   getConversations(input: { limit: number; offset: number; archived: boolean }) {
     return this.sdk.getConversations(input)
   }
+  listInbox(options: { limit: number; cursor: string | null; archived: boolean }) { return this.sdk.listInbox(options) }
   getConversation(id: string) { return this.sdk.getConversation(id) }
   getMessages(input: Parameters<ConvoKitClient['getMessages']>[0]) { return this.sdk.getMessages(input) }
   getMessage(id: string) { return this.sdk.getMessage(id) }
@@ -49,6 +57,7 @@ export class DefaultConvoKitUiClient implements ConvoKitUiClient {
     return this.sdk.realtime.onConnectionEvent({ onEvent: handler, onSessionEnded: ended })
   }
   onInboxChanged(handler: () => void) { return this.sdk.realtime.onInboxChanged(this.sdk.clientId, handler) }
+  onInboxActivity(handler: () => void) { return this.sdk.realtime.onInboxActivity(this.sdk.clientId, handler) }
   onMessage(id: string, handler: (event: MessageEvent) => void) { return this.sdk.realtime.onMessage(id, handler) }
   onMessageDeleted(id: string, handler: (event: MessageDeletedEvent) => void) {
     return this.sdk.realtime.onMessageDeleted(id, handler)
