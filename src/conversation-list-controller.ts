@@ -1,4 +1,6 @@
-import type { Conversation, InboxPage, InboxSummary, RealtimeSubscription } from '@convokitapp/react-native'
+import type {
+  ClearConversationUnreadOptions, Conversation, ConversationPrivateState, InboxPage, InboxSummary, RealtimeSubscription,
+} from '@convokitapp/react-native'
 import type { ConvoKitUiClient } from './client'
 import { filterConversations, type ConversationFilter, type ConversationPageLoader } from './filter'
 import { mergeInboxEntries } from './inbox'
@@ -157,6 +159,37 @@ export class ConversationListController extends ObservableStore<ConversationList
   }
   setQuery(query: string): Promise<void> { return this.setFilter({ ...this.filter, query }) }
 
+  /** Flag a room unread for the caller only (`markConversationUnread`). The response is applied to the
+   * room's summary unless a newer private state is already stored; a request failure sets `error` and
+   * keeps the row. Both apply only while this load of the store is still current (not disposed, retired
+   * or reloaded for another session). Rejects when the adapter lacks the 0.7 member. Other devices learn
+   * of the marker through `inbox_activity`.
+   */
+  async markUnread(conversationId: string): Promise<void> {
+    const mark = this.options.client.markConversationUnread
+    if (!mark) throw new Error('The ConvoKitUiClient adapter does not implement markConversationUnread')
+    const generation = this.generation
+    try {
+      this.applyPrivateState(conversationId, await mark.call(this.options.client, conversationId), generation)
+    } catch (error) { this.reportPrivateStateError(error, generation) }
+  }
+
+  /** Remove the caller's marker (`clearConversationUnread`), conditionally on `options.ifVersion`. Resolves
+   * the response's `cleared`: whether this request removed the marker, not whether the room is read. The
+   * response is applied to the summary either way; a request failure sets `error`, keeps the row and
+   * resolves `false`. Rejects when the adapter lacks the 0.7 member.
+   */
+  async clearUnread(conversationId: string, options?: ClearConversationUnreadOptions): Promise<boolean> {
+    const clear = this.options.client.clearConversationUnread
+    if (!clear) throw new Error('The ConvoKitUiClient adapter does not implement clearConversationUnread')
+    const generation = this.generation
+    try {
+      const result = await clear.call(this.options.client, conversationId, options ?? {})
+      this.applyPrivateState(conversationId, result, generation)
+      return result.cleared
+    } catch (error) { this.reportPrivateStateError(error, generation); return false }
+  }
+
   async dispose(): Promise<void> {
     if (this.disposed) return
     this.disposed = true; ++this.generation
@@ -282,6 +315,29 @@ export class ConversationListController extends ObservableStore<ConversationList
       this.source = []; this.summaries = noSummaries; this.offset = 0; this.cursor = null; this.hasMore = false
     }
     this.error = error
+  }
+  /** Apply a mark/clear response to the room's CURRENT summary as one unit (a refresh may have swapped
+   * it): the marker and the version replace the stored ones only when the response is newer, then
+   * `isUnread` is recomputed from the stored counts and the marker. An equal version carries the state
+   * already stored (a no-op) and a lower one is ignored entirely, so a delayed response never resurrects
+   * a marker a newer action removed. A response from a generation that is no longer current (the store
+   * was disposed, retired, or reloaded, possibly for another user) is dropped: the version gate alone
+   * cannot tell another user's row from ours. The legacy path has no summary to patch.
+   */
+  private applyPrivateState(conversationId: string, state: ConversationPrivateState, generation: number): void {
+    if (!this.current(generation)) return
+    const stored = this.summaries.get(conversationId)
+    if (!stored || state.privateStateVersion <= stored.privateStateVersion) return
+    const summaries = new Map(this.summaries)
+    summaries.set(conversationId, {
+      ...stored, unreadMarkedAt: state.unreadMarkedAt, privateStateVersion: state.privateStateVersion,
+      isUnread: stored.unreadCount > 0 || stored.unreadCountCapped || state.unreadMarkedAt !== null,
+    })
+    this.summaries = summaries; this.emit()
+  }
+  private reportPrivateStateError(error: unknown, generation: number): void {
+    if (!this.current(generation)) return
+    this.error = error; this.emit()
   }
   private current(generation: number): boolean {
     return !this.disposed && !this.retired && generation === this.generation &&

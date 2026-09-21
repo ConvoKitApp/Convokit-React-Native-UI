@@ -112,9 +112,11 @@ function DefaultConversationRow({ conversation, onPress, summary, currentUserId 
     {summary
       ? <View style={styles.rowMeta}>
         <Text style={{ color: theme.colors.mutedText, fontSize: theme.typography.caption }}>{formatMessageTime(summary.activityAt)}</Text>
-        {!!badge && <View accessibilityLabel={badge.accessibilityLabel} style={[styles.badge, { backgroundColor: theme.colors.badge ?? theme.colors.primary }]}>
-          <Text accessibilityElementsHidden importantForAccessibility="no-hide-descendants" style={styles.badgeLabel}>{badge.label}</Text>
-        </View>}
+        {!!badge && (badge.dot
+          ? <View accessibilityLabel={badge.accessibilityLabel} style={[styles.dot, { backgroundColor: theme.colors.badge ?? theme.colors.primary }]} />
+          : <View accessibilityLabel={badge.accessibilityLabel} style={[styles.badge, { backgroundColor: theme.colors.badge ?? theme.colors.primary }]}>
+            <Text accessibilityElementsHidden importantForAccessibility="no-hide-descendants" style={styles.badgeLabel}>{badge.label}</Text>
+          </View>)}
       </View>
       : <Text style={{ color: theme.colors.mutedText, fontSize: 22 }}>›</Text>}
   </Pressable>
@@ -329,4 +331,5 @@ const styles = StyleSheet.create({
   rowMeta: { alignItems: 'flex-end', gap: 4 },
   badge: { minWidth: 20, height: 20, borderRadius: 10, paddingHorizontal: 6, alignItems: 'center', justifyContent: 'center' },
   badgeLabel: { color: '#fff', fontSize: 11, fontWeight: '700' },
+  dot: { width: 8, height: 8, borderRadius: 4 },
 })

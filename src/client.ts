@@ -1,6 +1,7 @@
 import type {
-  ConvoKitClient, Conversation, InboxPage, MarkConversationReadOptions, Message, MessageDeletedEvent, MessageEvent,
-  MessageMedia, ReadEvent, RealtimeConnectionEvent, RealtimeSubscription, TypingEvent,
+  ClearConversationUnreadOptions, ClearUnreadResult, ConversationPrivateState, ConvoKitClient, Conversation, InboxPage,
+  MarkConversationReadOptions, Message, MessageDeletedEvent, MessageEvent, MessageMedia, ReadEvent,
+  RealtimeConnectionEvent, RealtimeSubscription, TypingEvent,
 } from '@convokitapp/react-native'
 
 export interface ConvoKitUiClient {
@@ -25,9 +26,20 @@ export interface ConvoKitUiClient {
   }): Promise<Message>
   /** Acknowledge through `options.throughMessageId` (the newest rendered message). Adapters that ignore the
    * target degrade to acknowledging the newest message on the server at request time; a target the server
-   * no longer knows must reject with an error whose `code` is `MESSAGE_NOT_FOUND`.
+   * no longer knows must reject with an error whose `code` is `MESSAGE_NOT_FOUND`. Since 0.7 the options
+   * may also carry `privateStateVersion`, the version captured when the room opened; forward the options
+   * unchanged, or the caller's unread marker is never cleared by an acknowledgement.
    */
   markConversationRead(id: string, options?: MarkConversationReadOptions): Promise<void>
+  /** The 0.7 private marker: flag the room unread for the caller only. Optional so 0.6 adapters keep
+   * compiling; `ConversationListController.markUnread` rejects without it.
+   */
+  markConversationUnread?(id: string): Promise<ConversationPrivateState>
+  /** Remove the caller's marker; with `ifVersion` only while it still has that version (`cleared: false`
+   * otherwise, never an error). Optional; `ConversationListController.clearUnread` rejects without it and a
+   * room controller opened on a marked, empty room leaves the marker in place.
+   */
+  clearConversationUnread?(id: string, options?: ClearConversationUnreadOptions): Promise<ClearUnreadResult>
   sendTyping(input: { conversationId: string; isTyping: boolean }): Promise<void>
   onConnectionEvent(handler: (event: RealtimeConnectionEvent) => void, ended: () => void): RealtimeSubscription
   onInboxChanged(handler: () => void): RealtimeSubscription
@@ -51,6 +63,10 @@ export class DefaultConvoKitUiClient implements ConvoKitUiClient {
   sendMessage(input: Parameters<ConvoKitClient['sendMessage']>[0]) { return this.sdk.sendMessage(input) }
   markConversationRead(id: string, options?: MarkConversationReadOptions) {
     return this.sdk.markConversationRead(id, options ?? {})
+  }
+  markConversationUnread(id: string) { return this.sdk.markConversationUnread(id) }
+  clearConversationUnread(id: string, options?: ClearConversationUnreadOptions) {
+    return this.sdk.clearConversationUnread(id, options ?? {})
   }
   sendTyping(input: { conversationId: string; isTyping: boolean }) { return this.sdk.sendTyping(input) }
   onConnectionEvent(handler: (event: RealtimeConnectionEvent) => void, ended: () => void) {

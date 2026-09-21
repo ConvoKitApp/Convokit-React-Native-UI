@@ -67,11 +67,16 @@ export function conversationPreview(
   return body
 }
 
-/** The unread badge for a summary, or null when nothing is unread. The visible label caps at `99+`;
- * the accessible name carries the real count unless the server capped it.
+/** The unread badge for a summary, or null when nothing is unread. A count (or a capped count) is the
+ * numeric badge: the visible label caps at `99+` and the accessible name carries the real count unless the
+ * server capped it. A room the caller marked unread with no count (`isUnread` while `unreadCount` is 0
+ * and not capped) is a numberless dot: an empty label, the accessible name `Unread` and `dot: true`,
+ * never an invented count. A summary built without `isUnread` keeps the numeric rule.
  */
-export function unreadBadge(summary: InboxSummary): { label: string; accessibilityLabel: string } | null {
-  if (summary.unreadCount <= 0 && !summary.unreadCountCapped) return null
-  const label = summary.unreadCount <= 99 && !summary.unreadCountCapped ? String(summary.unreadCount) : '99+'
-  return { label, accessibilityLabel: summary.unreadCountCapped ? '99+ unread' : `${summary.unreadCount} unread` }
+export function unreadBadge(summary: InboxSummary): { label: string; accessibilityLabel: string; dot?: boolean } | null {
+  if (summary.unreadCount > 0 || summary.unreadCountCapped) {
+    const label = summary.unreadCount <= 99 && !summary.unreadCountCapped ? String(summary.unreadCount) : '99+'
+    return { label, accessibilityLabel: summary.unreadCountCapped ? '99+ unread' : `${summary.unreadCount} unread` }
+  }
+  return summary.isUnread ? { label: '', accessibilityLabel: 'Unread', dot: true } : null
 }

@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
-  Conversation, InboxEntry, InboxPage, InboxSummary, Message, MessageDeletedEvent, MessageEvent, Participant,
-  ReadEvent, ReadPosition, RealtimeSubscription,
+  ClearConversationUnreadOptions, ClearUnreadResult, Conversation, ConversationMembership, ConversationPrivateState,
+  InboxEntry, InboxPage, InboxSummary, Message, MessageDeletedEvent, MessageEvent, Participant, ReadEvent, ReadPosition,
+  RealtimeSubscription,
 } from '@convokitapp/react-native'
 import { ConversationController } from '../src/conversation-controller'
 import { ConversationListController } from '../src/conversation-list-controller'
@@ -29,6 +30,10 @@ const message = (id: string, senderId: string, createdAt: Date, text: string | n
   createdAt, updatedAt: null,
 })
 const position = (row: Message): ReadPosition => ({ messageId: row.id, createdAt: row.createdAt })
+/** The caller's own row as a 0.7 backend serves it beside the conversation; marked when `unreadMarkedAt` is set. */
+const membership = (privateStateVersion: number, unreadMarkedAt: Date | null = null): ConversationMembership => ({
+  role: 'READ_WRITE', lastReadAt: null, readPosition: null, unreadMarkedAt, privateStateVersion,
+})
 const close = (): RealtimeSubscription => ({ closed: false, unsubscribe: vi.fn().mockResolvedValue(undefined) })
 const flush = () => new Promise(resolve => setTimeout(resolve, 0))
 function deferred<T = void>() {
@@ -37,7 +42,10 @@ function deferred<T = void>() {
   return { promise, resolve, reject }
 }
 
-function client(rows: Message[] = [], participants: Participant[] = []) {
+/** `membership` makes `getConversation` answer like a 0.7 backend; `unread: false` builds a 0.6 adapter without
+ * the optional mark/clear members.
+ */
+function client(rows: Message[] = [], participants: Participant[] = [], options: { membership?: ConversationMembership; unread?: boolean } = {}) {
   const session = {}
   const handlers: {
     message?: (event: MessageEvent) => void
@@ -47,7 +55,7 @@ function client(rows: Message[] = [], participants: Participant[] = []) {
   const sdk: ConvoKitUiClient = {
     currentUserId: 'me', sessionIdentity: session,
     getConversations: vi.fn().mockResolvedValue([conversation]),
-    getConversation: vi.fn(async () => ({ ...conversation, participants })),
+    getConversation: vi.fn(async () => ({ ...conversation, participants, ...(options.membership ? { membership: options.membership } : {}) })),
     getMessages: vi.fn(async () => [...rows].reverse()),
     getMessage: vi.fn(async (id: string) => {
       const row = rows.find(candidate => candidate.id === id)
@@ -60,6 +68,12 @@ function client(rows: Message[] = [], participants: Participant[] = []) {
       createdAt: new Date(), updatedAt: null,
     } satisfies Message)),
     markConversationRead: vi.fn().mockResolvedValue(undefined),
+    ...(options.unread === false ? {} : {
+      markConversationUnread: vi.fn(async (id: string): Promise<ConversationPrivateState> =>
+        ({ conversationId: id, unreadMarkedAt: at(60), privateStateVersion: 1 })),
+      clearConversationUnread: vi.fn(async (id: string, clear?: ClearConversationUnreadOptions): Promise<ClearUnreadResult> =>
+        ({ conversationId: id, cleared: true, unreadMarkedAt: null, privateStateVersion: (clear?.ifVersion ?? 0) + 1 })),
+    }),
     sendTyping: vi.fn().mockResolvedValue(undefined),
     onConnectionEvent: vi.fn(close), onInboxChanged: vi.fn(close),
     onMessage: vi.fn((_, handler) => { handlers.message = handler; return close() }),
@@ -68,6 +82,9 @@ function client(rows: Message[] = [], participants: Participant[] = []) {
     onTyping: vi.fn(close),
   }
   const targets = () => vi.mocked(sdk.markConversationRead).mock.calls.map(([, options]) => options?.throughMessageId)
+  /** Every acknowledgement body as sent, so a version (or its absence) is pinned exactly. */
+  const acks = () => vi.mocked(sdk.markConversationRead).mock.calls.map(([, options]) => options)
+  const clears = () => vi.mocked(sdk.clearConversationUnread!).mock.calls
   const live = {
     async insert(row: Message, type: MessageEvent['type'] = 'insert') {
       const index = rows.findIndex(candidate => candidate.id === row.id)
@@ -77,7 +94,7 @@ function client(rows: Message[] = [], participants: Participant[] = []) {
     async remove(id: string) { handlers.deleted!({ id, conversationId: 'room' }); await flush() },
     read(userId: string, readAt: Date, readPosition: ReadPosition | null = null) { handlers.read!({ userId, readAt, readPosition }) },
   }
-  return { sdk, targets, live, rows, participants }
+  return { sdk, targets, acks, clears, live, rows, participants }
 }
 
 describe('UI state', () => {
@@ -395,12 +412,179 @@ describe('acknowledgements', () => {
   })
 })
 
+describe('private unread marker', () => {
+  const marked = (version: number) => membership(version, at(0))
+
+  it('captures the version at open and sends it with every targeted acknowledgement of that open', async () => {
+    const { sdk, acks, live } = client([message('m1', 'alex', at(10))], [], { membership: membership(7) })
+    const controller = new ConversationController({ conversationId: 'room', client: sdk, autoLoad: false })
+    await controller.loadInitial()
+    expect(acks()).toEqual([{ throughMessageId: 'm1', privateStateVersion: 7 }])
+    // Another device marked the room since; the refresh learns version 9 but this open keeps sending 7.
+    vi.mocked(sdk.getConversation).mockResolvedValue({ ...conversation, membership: marked(9) })
+    await controller.refresh()
+    expect(controller.getSnapshot().conversation?.membership?.privateStateVersion).toBe(9)
+    await live.insert(message('m2', 'alex', at(20)))
+    await controller.markRead()
+    expect(acks()).toEqual([
+      { throughMessageId: 'm1', privateStateVersion: 7 }, { throughMessageId: 'm2', privateStateVersion: 7 },
+    ])
+    expect(controller.getSnapshot().error).toBeNull()
+    await controller.dispose()
+  })
+
+  it('sends no version for a 0.6 conversation without a membership', async () => {
+    const { sdk, acks, live } = client([message('m1', 'alex', at(10))])
+    const controller = new ConversationController({ conversationId: 'room', client: sdk, autoLoad: false })
+    await controller.loadInitial()
+    await live.insert(message('m2', 'alex', at(20)))
+    expect(acks()).toEqual([{ throughMessageId: 'm1' }, { throughMessageId: 'm2' }])
+    expect(acks().some(body => body && 'privateStateVersion' in body)).toBe(false)
+    await controller.dispose()
+  })
+
+  it('captures once from the reconcile that follows a transient first-load failure', async () => {
+    const { sdk, acks, rows } = client([message('m1', 'alex', at(10))], [], { membership: membership(7) })
+    vi.mocked(sdk.getConversation).mockRejectedValueOnce(new Error('offline'))
+    const controller = new ConversationController({ conversationId: 'room', client: sdk, autoLoad: false })
+    await controller.loadInitial()
+    expect(controller.getSnapshot()).toMatchObject({ conversation: null, hasLoaded: true })
+    expect(acks()).toEqual([])
+    await controller.refresh()
+    expect(controller.getSnapshot().conversation?.membership?.privateStateVersion).toBe(7)
+    await controller.markRead()
+    expect(acks()).toEqual([{ throughMessageId: 'm1', privateStateVersion: 7 }])
+    // A later reconcile of the same open never recaptures.
+    vi.mocked(sdk.getConversation).mockResolvedValue({ ...conversation, membership: marked(9) })
+    rows.push(message('m2', 'alex', at(20)))
+    await controller.refresh()
+    await controller.markRead()
+    expect(acks()).toEqual([
+      { throughMessageId: 'm1', privateStateVersion: 7 }, { throughMessageId: 'm2', privateStateVersion: 7 },
+    ])
+    await controller.dispose()
+  })
+
+  it('recaptures on the next loadInitial and after a session end', async () => {
+    const { sdk, acks } = client([message('m1', 'alex', at(10))], [], { membership: membership(7) })
+    const controller = new ConversationController({ conversationId: 'room', client: sdk, autoLoad: false })
+    await controller.loadInitial()
+    vi.mocked(sdk.getConversation).mockResolvedValue({ ...conversation, membership: marked(9) })
+    await controller.loadInitial()
+    expect(acks()).toEqual([
+      { throughMessageId: 'm1', privateStateVersion: 7 }, { throughMessageId: 'm1', privateStateVersion: 9 },
+    ])
+    await controller.dispose()
+  })
+
+  it('clears the marker of an opened empty room once, conditionally on the captured version', async () => {
+    const { sdk, acks, clears } = client([], [], { membership: marked(7) })
+    const controller = new ConversationController({ conversationId: 'room', client: sdk, autoLoad: false })
+    await controller.loadInitial()
+    expect(clears()).toEqual([['room', { ifVersion: 7 }]])
+    expect(acks()).toEqual([])
+    await controller.markRead()
+    await controller.refresh()
+    controller.setVisible(false); controller.setVisible(true)
+    await flush()
+    expect(clears()).toHaveLength(1)
+    expect(controller.getSnapshot().error).toBeNull()
+    await controller.dispose()
+  })
+
+  it('defers the empty-room clear while hidden and issues it on visibility', async () => {
+    const { sdk, clears } = client([], [], { membership: marked(7) })
+    const controller = new ConversationController({ conversationId: 'room', client: sdk, autoLoad: false })
+    controller.setVisible(false)
+    await controller.loadInitial()
+    expect(clears()).toEqual([])
+    controller.setVisible(true)
+    await flush()
+    expect(clears()).toEqual([['room', { ifVersion: 7 }]])
+    await controller.dispose()
+  })
+
+  it('sends no clear while markReadOnLoad is off until an explicit markRead()', async () => {
+    const { sdk, clears } = client([], [], { membership: marked(7) })
+    const controller = new ConversationController({ conversationId: 'room', client: sdk, autoLoad: false, markReadOnLoad: false })
+    await controller.loadInitial()
+    controller.setVisible(false); controller.setVisible(true)
+    await flush()
+    expect(clears()).toEqual([])
+    await controller.markRead()
+    expect(clears()).toEqual([['room', { ifVersion: 7 }]])
+    await controller.markRead()
+    expect(clears()).toHaveLength(1)
+    await controller.dispose()
+  })
+
+  it('never clears through the adapter once a row was rendered or when nothing was marked', async () => {
+    const withRows = client([message('m1', 'alex', at(10))], [], { membership: marked(7) })
+    const rendered = new ConversationController({ conversationId: 'room', client: withRows.sdk, autoLoad: false })
+    await rendered.loadInitial()
+    expect(withRows.acks()).toEqual([{ throughMessageId: 'm1', privateStateVersion: 7 }])
+    // The room empties again: the targeted acknowledgement already carried the version, so no clear follows.
+    await withRows.live.remove('m1')
+    await rendered.markRead()
+    expect(rendered.getSnapshot().messages).toEqual([])
+    expect(withRows.clears()).toEqual([])
+    const unmarked = client([], [], { membership: membership(7) })
+    const empty = new ConversationController({ conversationId: 'room', client: unmarked.sdk, autoLoad: false })
+    await empty.loadInitial()
+    await empty.markRead()
+    expect(unmarked.clears()).toEqual([])
+    expect(unmarked.acks()).toEqual([])
+    const legacy = client()
+    const older = new ConversationController({ conversationId: 'room', client: legacy.sdk, autoLoad: false })
+    await older.loadInitial()
+    expect(legacy.clears()).toEqual([])
+    await rendered.dispose(); await empty.dispose(); await older.dispose()
+  })
+
+  it('acknowledges a row that arrives during the clear and treats cleared: false as success', async () => {
+    const { sdk, acks, clears, live } = client([], [], { membership: marked(7) })
+    const pending = deferred<ClearUnreadResult>()
+    vi.mocked(sdk.clearConversationUnread!).mockReturnValueOnce(pending.promise)
+    const controller = new ConversationController({ conversationId: 'room', client: sdk, autoLoad: false })
+    const load = controller.loadInitial()
+    await flush()
+    expect(clears()).toEqual([['room', { ifVersion: 7 }]])
+    await live.insert(message('m1', 'alex', at(10)))
+    expect(acks()).toEqual([])
+    pending.resolve({ conversationId: 'room', cleared: false, unreadMarkedAt: at(5), privateStateVersion: 8 })
+    await load
+    expect(acks()).toEqual([{ throughMessageId: 'm1', privateStateVersion: 7 }])
+    expect(clears()).toHaveLength(1)
+    expect(controller.getSnapshot().error).toBeNull()
+    await controller.dispose()
+  })
+
+  it('surfaces a failed clear through error and skips the clear for an adapter without the member', async () => {
+    const failing = client([], [], { membership: marked(7) })
+    const failure = Object.assign(new Error('Conversation not found'), { status: 404 })
+    vi.mocked(failing.sdk.clearConversationUnread!).mockRejectedValueOnce(failure)
+    const controller = new ConversationController({ conversationId: 'room', client: failing.sdk, autoLoad: false })
+    await controller.loadInitial()
+    expect(controller.getSnapshot().error).toBe(failure)
+    const legacy = client([], [], { membership: marked(7), unread: false })
+    const older = new ConversationController({ conversationId: 'room', client: legacy.sdk, autoLoad: false })
+    await older.loadInitial()
+    await older.markRead()
+    expect(legacy.sdk.clearConversationUnread).toBeUndefined()
+    expect(legacy.acks()).toEqual([])
+    expect(older.getSnapshot().error).toBeNull()
+    await controller.dispose(); await older.dispose()
+  })
+})
+
 const room = (id: string, overrides: Partial<Conversation> = {}): Conversation => ({
   ...conversation, id, title: id, displayTitle: id, ...overrides,
 })
-const summary = (activityAt: Date, overrides: Partial<InboxSummary> = {}): InboxSummary => ({
-  latestMessage: null, unreadCount: 0, unreadCountCapped: false, readPosition: null, lastReadAt: null, activityAt, ...overrides,
-})
+/** 0.7 summary literal: `isUnread` is derived from the count, the cap and the marker unless overridden. */
+const summary = (activityAt: Date, overrides: Partial<InboxSummary> = {}): InboxSummary => {
+  const base = { latestMessage: null, unreadCount: 0, unreadCountCapped: false, readPosition: null, lastReadAt: null, unreadMarkedAt: null, privateStateVersion: 0, activityAt, ...overrides }
+  return { isUnread: base.unreadCount > 0 || base.unreadCountCapped || base.unreadMarkedAt !== null, ...base }
+}
 const entry = (id: string, seconds: number, overrides: Partial<InboxSummary> = {}): InboxEntry => ({
   conversation: room(id), ...summary(at(seconds), overrides),
 })
@@ -408,13 +592,20 @@ const page = (entries: InboxEntry[], nextCursor: string | null = null): InboxPag
 type InboxRequest = { limit: number; cursor: string | null; archived: boolean }
 const status = (code: number) => Object.assign(new Error(`HTTP ${code}`), { status: code })
 
-function listClient(options: { inbox?: boolean } = {}) {
+/** `inbox: false` is a 0.5 adapter (legacy path); `unread: false` a 0.6 adapter without the mark/clear members. */
+function listClient(options: { inbox?: boolean; unread?: boolean } = {}) {
   const session = {}
   const signals: { activity?: () => void; changed?: () => void; ended?: () => void } = {}
   const sdk: ConvoKitUiClient = {
     currentUserId: 'me', sessionIdentity: session,
     getConversations: vi.fn().mockResolvedValue([]),
     ...(options.inbox === false ? {} : { listInbox: vi.fn().mockResolvedValue(page([])) }),
+    ...(options.unread === false ? {} : {
+      markConversationUnread: vi.fn(async (id: string): Promise<ConversationPrivateState> =>
+        ({ conversationId: id, unreadMarkedAt: at(60), privateStateVersion: 1 })),
+      clearConversationUnread: vi.fn(async (id: string): Promise<ClearUnreadResult> =>
+        ({ conversationId: id, cleared: true, unreadMarkedAt: null, privateStateVersion: 2 })),
+    }),
     getConversation: vi.fn(), getMessages: vi.fn(), getMessage: vi.fn(), sendMessage: vi.fn(),
     markConversationRead: vi.fn().mockResolvedValue(undefined), sendTyping: vi.fn().mockResolvedValue(undefined),
     onConnectionEvent: vi.fn((_, ended) => { signals.ended = ended; return close() }),
@@ -900,5 +1091,173 @@ describe('ConversationListController', () => {
     await controller.setFilter({})
     expect(ids(controller)).toEqual(['b', 'a'])
     await controller.dispose()
+  })
+
+  describe('private unread marker', () => {
+    const marker = (seconds: number, privateStateVersion: number): Partial<InboxSummary> => ({ unreadMarkedAt: at(seconds), privateStateVersion })
+    const summaryOf = (controller: ConversationListController, id: string) => controller.getSnapshot().summaries.get(id)
+
+    it('parses a marked entry as unread with no count and keeps it through a loadMore merge', async () => {
+      const { sdk, inbox } = listClient()
+      inbox(({ cursor }) => cursor === null
+        ? page([entry('a', 50, marker(60, 1)), entry('b', 40)], 'c1')
+        : page([entry('c', 30), entry('b', 20)]))
+      const controller = list(sdk)
+      await controller.loadInitial()
+      expect(summaryOf(controller, 'a')).toMatchObject({ isUnread: true, unreadCount: 0, unreadMarkedAt: at(60), privateStateVersion: 1 })
+      expect(summaryOf(controller, 'b')).toMatchObject({ isUnread: false, unreadMarkedAt: null, privateStateVersion: 0 })
+      await controller.loadMore()
+      expect(ids(controller)).toEqual(['a', 'c', 'b'])
+      expect(summaryOf(controller, 'a')).toMatchObject({ isUnread: true, unreadMarkedAt: at(60), privateStateVersion: 1 })
+      await controller.dispose()
+    })
+
+    it('marks a room unread and patches its summary from the response without a refetch', async () => {
+      const { sdk, inbox, requests } = listClient()
+      inbox(() => page([entry('a', 50), entry('b', 40)]))
+      const controller = list(sdk)
+      await controller.loadInitial()
+      const listener = vi.fn(); controller.subscribe(listener)
+      await controller.markUnread('a')
+      expect(sdk.markConversationUnread).toHaveBeenCalledWith('a')
+      expect(summaryOf(controller, 'a')).toMatchObject({ isUnread: true, unreadCount: 0, unreadMarkedAt: at(60), privateStateVersion: 1 })
+      expect(summaryOf(controller, 'b')).toMatchObject({ isUnread: false, unreadMarkedAt: null, privateStateVersion: 0 })
+      expect(listener).toHaveBeenCalledTimes(1)
+      expect(requests()).toHaveLength(1)
+      expect(controller.getSnapshot().error).toBeNull()
+      await controller.dispose()
+    })
+
+    it('clears a marker, resolves the response\'s cleared and patches on both answers', async () => {
+      const { sdk, inbox } = listClient()
+      inbox(() => page([entry('a', 50, marker(60, 1))]))
+      const controller = list(sdk)
+      await controller.loadInitial()
+      await expect(controller.clearUnread('a', { ifVersion: 1 })).resolves.toBe(true)
+      expect(sdk.clearConversationUnread).toHaveBeenCalledWith('a', { ifVersion: 1 })
+      expect(summaryOf(controller, 'a')).toMatchObject({ isUnread: false, unreadMarkedAt: null, privateStateVersion: 2 })
+      // A stale conditional clear answers cleared: false with the current (re-marked) state, applied as well.
+      vi.mocked(sdk.clearConversationUnread!).mockResolvedValueOnce({ conversationId: 'a', cleared: false, unreadMarkedAt: at(70), privateStateVersion: 3 })
+      await expect(controller.clearUnread('a', { ifVersion: 1 })).resolves.toBe(false)
+      expect(summaryOf(controller, 'a')).toMatchObject({ isUnread: true, unreadMarkedAt: at(70), privateStateVersion: 3 })
+      // cleared: false with no marker and a higher version (another device cleared it) removes the dot.
+      vi.mocked(sdk.clearConversationUnread!).mockResolvedValueOnce({ conversationId: 'a', cleared: false, unreadMarkedAt: null, privateStateVersion: 4 })
+      await expect(controller.clearUnread('a')).resolves.toBe(false)
+      expect(sdk.clearConversationUnread).toHaveBeenLastCalledWith('a', {})
+      expect(summaryOf(controller, 'a')).toMatchObject({ isUnread: false, unreadMarkedAt: null, privateStateVersion: 4 })
+      await controller.dispose()
+    })
+
+    it('keeps the count-based unread state when a marker is cleared', async () => {
+      const { sdk, inbox } = listClient()
+      inbox(() => page([entry('a', 50, { unreadCount: 3, ...marker(60, 1) })]))
+      const controller = list(sdk)
+      await controller.loadInitial()
+      await expect(controller.clearUnread('a', { ifVersion: 1 })).resolves.toBe(true)
+      expect(summaryOf(controller, 'a')).toMatchObject({ isUnread: true, unreadCount: 3, unreadMarkedAt: null, privateStateVersion: 2 })
+      await controller.dispose()
+    })
+
+    it('ignores a mutation response older than the stored summary', async () => {
+      const { sdk, signals, inbox } = listClient()
+      let cleared = false
+      inbox(() => page([entry('a', 50, cleared ? { unreadMarkedAt: null, privateStateVersion: 2 } : {})]))
+      const controller = list(sdk, { activityRefreshWindowMs: 0 })
+      await controller.loadInitial()
+      const held = deferred<ConversationPrivateState>()
+      vi.mocked(sdk.markConversationUnread!).mockReturnValueOnce(held.promise)
+      const marking = controller.markUnread('a')
+      // A newer action elsewhere already removed the marker (version 2) and the activity signal delivered it.
+      cleared = true
+      signals.activity!()
+      await flush()
+      expect(summaryOf(controller, 'a')).toMatchObject({ isUnread: false, privateStateVersion: 2 })
+      held.resolve({ conversationId: 'a', unreadMarkedAt: at(60), privateStateVersion: 1 })
+      await marking
+      expect(summaryOf(controller, 'a')).toMatchObject({ isUnread: false, unreadMarkedAt: null, privateStateVersion: 2 })
+      // An equal version carries the stored state already: a no-op that publishes nothing.
+      const listener = vi.fn(); controller.subscribe(listener)
+      vi.mocked(sdk.clearConversationUnread!).mockResolvedValueOnce({ conversationId: 'a', cleared: false, unreadMarkedAt: null, privateStateVersion: 2 })
+      await expect(controller.clearUnread('a')).resolves.toBe(false)
+      expect(summaryOf(controller, 'a')).toMatchObject({ isUnread: false, unreadMarkedAt: null, privateStateVersion: 2 })
+      expect(listener).not.toHaveBeenCalled()
+      expect(controller.getSnapshot().error).toBeNull()
+      await controller.dispose()
+    })
+
+    it('rejects markUnread and clearUnread for an adapter without the 0.7 members', async () => {
+      const { sdk, inbox } = listClient({ unread: false })
+      inbox(() => page([entry('a', 50)]))
+      const controller = list(sdk)
+      await controller.loadInitial()
+      await expect(controller.markUnread('a')).rejects.toThrow('markConversationUnread')
+      await expect(controller.clearUnread('a')).rejects.toThrow('clearConversationUnread')
+      expect(summaryOf(controller, 'a')).toMatchObject({ isUnread: false })
+      expect(controller.getSnapshot().error).toBeNull()
+      await controller.dispose()
+    })
+
+    it('surfaces a failed mark or clear through error without evicting rows', async () => {
+      const { sdk, inbox } = listClient()
+      inbox(() => page([entry('a', 50)]))
+      const controller = list(sdk)
+      await controller.loadInitial()
+      vi.mocked(sdk.markConversationUnread!).mockRejectedValueOnce(status(404))
+      await controller.markUnread('a')
+      expect(controller.getSnapshot().error).toEqual(status(404))
+      expect(ids(controller)).toEqual(['a'])
+      vi.mocked(sdk.clearConversationUnread!).mockRejectedValueOnce(status(500))
+      await expect(controller.clearUnread('a')).resolves.toBe(false)
+      expect(controller.getSnapshot().error).toEqual(status(500))
+      expect(summaryOf(controller, 'a')).toMatchObject({ isUnread: false, privateStateVersion: 0 })
+      await controller.dispose()
+    })
+
+    it('drops a response that lands after the session changed hands and the next user loaded', async () => {
+      const { sdk, signals, inbox } = listClient()
+      inbox(() => page([entry('a', 50)]))
+      const controller = list(sdk)
+      await controller.loadInitial()
+      const heldMark = deferred<ConversationPrivateState>()
+      const heldClear = deferred<ClearUnreadResult>()
+      vi.mocked(sdk.markConversationUnread!).mockReturnValueOnce(heldMark.promise)
+      vi.mocked(sdk.clearConversationUnread!).mockReturnValueOnce(heldClear.promise)
+      const marking = controller.markUnread('a')
+      const clearing = controller.clearUnread('a')
+      // The session ends, a different user connects and the host reloads the list for them: room `a` is in
+      // their inbox too, unmarked at version 0, so the first user's late answers would pass the version gate.
+      signals.ended!()
+      Object.assign(sdk, { sessionIdentity: {} })
+      await controller.loadInitial()
+      expect(controller.getSnapshot()).toMatchObject({ currentUserId: 'me', error: null })
+      const listener = vi.fn(); controller.subscribe(listener)
+      heldMark.resolve({ conversationId: 'a', unreadMarkedAt: at(60), privateStateVersion: 6 })
+      heldClear.reject(status(500))
+      await marking
+      await expect(clearing).resolves.toBe(false)
+      expect(summaryOf(controller, 'a')).toMatchObject({ isUnread: false, unreadMarkedAt: null, privateStateVersion: 0 })
+      expect(controller.getSnapshot().error).toBeNull()
+      expect(listener).not.toHaveBeenCalled()
+      await controller.dispose()
+    })
+
+    it('calls the adapter on the legacy path and after dispose without a summary to patch', async () => {
+      const { sdk } = listClient({ inbox: false })
+      vi.mocked(sdk.getConversations).mockResolvedValue([room('legacy')])
+      const controller = list(sdk)
+      await controller.loadInitial()
+      const listener = vi.fn(); controller.subscribe(listener)
+      await controller.markUnread('legacy')
+      expect(sdk.markConversationUnread).toHaveBeenCalledWith('legacy')
+      expect(controller.getSnapshot().summaries.size).toBe(0)
+      expect(listener).not.toHaveBeenCalled()
+      const held = deferred<ConversationPrivateState>()
+      vi.mocked(sdk.markConversationUnread!).mockReturnValueOnce(held.promise)
+      const marking = controller.markUnread('legacy')
+      await controller.dispose()
+      held.resolve({ conversationId: 'legacy', unreadMarkedAt: at(60), privateStateVersion: 1 })
+      await marking
+      expect(listener).not.toHaveBeenCalled()
+    })
   })
 })

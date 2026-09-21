@@ -77,7 +77,8 @@ keep parsing the additive payload.
 (`listInbox`, cursor-based) whenever the adapter exposes it and no custom
 `pageLoader` is set. `ConversationListState` then carries `summaries`, a map
 from conversation id to `InboxSummary` (`latestMessage`, `unreadCount`,
-`unreadCountCapped`, `readPosition`, `lastReadAt`, `activityAt`), and
+`unreadCountCapped`, `readPosition`, `lastReadAt`, `activityAt`, and since
+0.7 `isUnread`, `unreadMarkedAt`, `privateStateVersion`), and
 `currentUserId`, the bound user (`''` without a session, on the legacy path
 and after `dispose`). `isRefreshing` reports a background walk.
 `conversations`, filters, comparators, custom offset `pageLoader`s and the
@@ -116,7 +117,9 @@ activity time is shown in the device zone. An unread badge renders while
 `<count> unread` (`99+ unread` when capped) and the visible label is hidden
 from the accessibility tree. The row's own accessible name appends
 `, <count> unread`. Unread titles use the heavier weight. The badge colour is
-the new theme token `colors.badge` (unset means `primary`).
+the new theme token `colors.badge` (unset means `primary`). A room the caller
+marked unread without a count renders a numberless dot instead; see
+[Mark unread](#mark-unread).
 
 Custom rows receive the additive `summary` and `currentUserId` on
 `ConversationRowContext`; `conversationPreview(conversation, summary,
@@ -138,5 +141,77 @@ same operation through `getConversations` without evicting rows; 401/403 from
 either endpoint and 404 from the legacy endpoint evict the rows, 400 keeps
 them and sets `error`.
 
-Version 0.6.0 requires `@convokitapp/react-native` 0.6.x. Publish
-`@convokitapp/react-native` before publishing this package.
+## Mark unread
+
+Since 0.7 a user can flag a room to come back to. The marker is private: other
+members, webhooks and `read` events never see it, and `unreadCount` is not
+changed. It needs the 0.7 backend and `@convokitapp/react-native` 0.7.
+
+`InboxSummary` carries `isUnread` (`unreadCount > 0 || unreadCountCapped ||
+unreadMarkedAt !== null`), `unreadMarkedAt` (`null` while nothing is marked)
+and `privateStateVersion`. A row is unread while `isUnread`, the count is above
+zero or the count is capped, and uses the heavier title weight. `unreadBadge`
+keeps returning the numeric badge for a count (`99+` when capped, marker or
+not); when `isUnread` is true while the count is 0 and not capped it returns
+`{ label: '', accessibilityLabel: 'Unread', dot: true }` and the default row
+renders an 8-pt circle in the badge colour with the accessible name `Unread`,
+never an invented count. The row's own accessible name becomes
+`Open <title>, Unread`. A summary built without `isUnread` keeps the numeric
+rule, so controlled lists with older fixtures render as before.
+
+`ConversationListController` (and so `useConvoKitConversationList`) exposes
+`markUnread(conversationId)` and `clearUnread(conversationId, { ifVersion? })`.
+They call the adapter's `markConversationUnread` / `clearConversationUnread`;
+on any answer the response's `{ unreadMarkedAt, privateStateVersion }` is
+applied to the room's current summary as one unit and `isUnread` is
+recomputed, but only when the response is newer than the stored version, so a
+delayed answer never resurrects a marker a newer action removed; an answer
+that lands after the store was disposed, retired or reloaded (possibly for
+another user) is dropped. `clearUnread`
+resolves the response's `cleared`: whether this request removed the marker,
+not whether the room is read. A stale `ifVersion` or an unmarked room resolves
+`false` with the current state applied. A request failure sets `error`, keeps
+the row and resolves `false`; an adapter without the two members makes both
+methods reject. Other devices learn of a change through `onInboxActivity`,
+which the list already refetches from. There is no default row action: wire
+one through a custom `renderItem` (a long-press, a menu) that calls the
+controller returned by `useConvoKitConversationList`, or pass your own
+`controller` to `ConvoKitConversationList`. On the legacy path (custom
+`pageLoader`, adapter without `listInbox`) the methods still call the adapter
+but there is no summary to patch.
+
+Capture at open: `ConversationController` reads
+`conversation.membership.privateStateVersion` (the caller's own row, returned
+by `getConversation` from a 0.7 backend) the first time the open's
+conversation loads (on `loadInitial`, or on the `refresh()` that follows a
+transient first-load failure) and sends it as `privateStateVersion` with every
+targeted acknowledgement of that open. The backend clears the marker only when
+that version is still current, so a mark issued after the room opened survives
+the acknowledgements that open keeps sending; a later `refresh()` (including
+the one `useConvoKitConversation` triggers on foreground) never re-captures,
+and `loadInitial()` or a new controller captures again. Against a 0.6 backend
+(no `membership`) acknowledgements carry no version and are byte-identical to
+0.6. An opened room that was marked and renders nothing has no target to
+acknowledge, so the controller calls
+`clearConversationUnread(id, { ifVersion: captured })` once per open instead:
+under the same gating as the load acknowledgement (`markReadOnLoad`, deferred
+while hidden and issued on visibility, also by an explicit `markRead()`), and
+never once a row was rendered, because the targeted acknowledgement clears
+then. `cleared: false` is not an error; a failed request surfaces as `error`.
+The controller still never sends an acknowledgement without a target.
+
+0.7.0 adapter change (additive): `ConvoKitUiClient` gains the optional
+`markConversationUnread(id)` and `clearConversationUnread(id, { ifVersion? })`;
+`DefaultConvoKitUiClient` implements both. Adapters without them keep
+compiling: the list methods reject and an empty marked room keeps its marker.
+`markConversationRead(id, options)` is unchanged, but `options` may now carry
+`privateStateVersion`: forward the options unchanged, since an adapter that
+drops them acknowledges without a version and never clears the marker.
+
+Mixed fleet: a 0.6 list ignores `isUnread` and shows no dot; a 0.7 list against
+a 0.6 backend derives `isUnread` from the count with no marker, and the
+`/unread` calls fail with status 404.
+
+Version 0.7.0 requires `@convokitapp/react-native` 0.7.x (peer
+`>=0.7.0 <0.8.0`). Publish `@convokitapp/react-native` before publishing this
+package.

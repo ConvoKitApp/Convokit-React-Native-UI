@@ -117,6 +117,14 @@ export class ConversationController extends ObservableStore<ConversationState> {
   private inFlight: MessageCursor | null = null
   private acknowledged: MessageCursor | null = null
   private unacknowledgeable = new Set<string>()
+  // Private state captured once per open, the first time `conversation` goes from null to a DTO (the
+  // `loadInitial` happy path, or a reconcile after a transient first-load failure), never from a later
+  // refresh: the version every targeted acknowledgement of this open sends (undefined from a 0.6 backend,
+  // which serves no `membership`), the version an opened-but-empty marked room clears its marker with
+  // (null once issued or when nothing was marked), and whether a confirmed row was ever rendered.
+  private openedVersion: number | undefined
+  private pendingClear: number | null = null
+  private rendered = false
 
   constructor(private options: ConversationControllerOptions) {
     super()
@@ -166,6 +174,7 @@ export class ConversationController extends ObservableStore<ConversationState> {
       if (!this.current(generation)) return
       this.assertRows(page)
       this.conversation = conversation
+      this.capture(conversation)
       this.mergeParticipantReads(conversation)
       this.merge(page); this.hasOlder = page.length === this.messagePageSize
       this.bind(generation); this.emit()
@@ -187,7 +196,11 @@ export class ConversationController extends ObservableStore<ConversationState> {
         this.options.client.getMessages({ conversationId: this.conversationId, limit: Math.max(this.messages.size, this.messagePageSize), offset: 0 }),
       ])
       if (!this.current(generation)) return
-      this.assertRows(page); this.conversation = conversation
+      this.assertRows(page)
+      // A reconcile after a failed first load is this open's first DTO; replacing one never recaptures.
+      const opening = this.conversation === null
+      this.conversation = conversation
+      if (opening) this.capture(conversation)
       const canonical = new Map(page.filter(row => !this.deleted.has(row.id)).map(row => [row.id, row]))
       for (const row of this.messages.values()) {
         if (isConvoKitPendingMessage(row)) canonical.set(row.id, row)
@@ -252,7 +265,10 @@ export class ConversationController extends ObservableStore<ConversationState> {
     } finally { if (this.current(generation)) { this.sending = false; this.emit() } }
   }
 
-  /** Acknowledge through the newest rendered message. Deferred while hidden; coalesced with other requests. */
+  /** Acknowledge through the newest rendered message (clearing the caller's unread marker when the version
+   * captured at open is still current), or clear the marker of a marked room that rendered nothing.
+   * Deferred while hidden; coalesced with other requests.
+   */
   markRead(): Promise<void> { return this.acknowledge() }
 
   /** Report platform visibility. Hidden defers acknowledgements; becoming visible re-issues a deferred one. */
@@ -327,7 +343,7 @@ export class ConversationController extends ObservableStore<ConversationState> {
     }
     if (!this.current(generation) || this.deleted.has(row.id)) return
     const existing = this.messages.get(row.id)
-    this.messages.set(row.id, existing ? newer(existing, complete) : complete)
+    this.messages.set(row.id, existing ? newer(existing, complete) : complete); this.rendered = true
     if (complete.clientMessageId) {
       for (const candidate of this.messages.values()) {
         if (isConvoKitPendingMessage(candidate) && candidate.clientMessageId === complete.clientMessageId &&
@@ -343,7 +359,7 @@ export class ConversationController extends ObservableStore<ConversationState> {
     for (const row of rows) {
       if (row.conversationId !== this.conversationId || this.deleted.has(row.id)) continue
       const existing = this.messages.get(row.id)
-      this.messages.set(row.id, existing ? newer(existing, row) : row)
+      this.messages.set(row.id, existing ? newer(existing, row) : row); this.rendered = true
     }
   }
   private remove(id: string): void {
@@ -397,10 +413,16 @@ export class ConversationController extends ObservableStore<ConversationState> {
         this.followUp = false
         if (!this.visible) { this.suppressed = true; return }
         const target = this.resolveTarget()
-        if (!target || (this.acknowledged && compareCursor(target, this.acknowledged) <= 0)) return
+        // Nothing rendered: the only request is the once-per-open clear of a marked room (D9); a row that
+        // arrives meanwhile sets `followUp` and is acknowledged by the next turn of the loop.
+        if (!target) { await this.clearMarker(generation); if (!this.current(generation)) return; continue }
+        if (this.acknowledged && compareCursor(target, this.acknowledged) <= 0) return
         this.inFlight = target
         try {
-          await this.options.client.markConversationRead(this.conversationId, { throughMessageId: target.id })
+          await this.options.client.markConversationRead(this.conversationId, {
+            throughMessageId: target.id,
+            ...(this.openedVersion === undefined ? {} : { privateStateVersion: this.openedVersion }),
+          })
           if (!this.current(generation)) return
           if (!this.unacknowledgeable.has(target.id)) this.acknowledged = target
         } catch (error) {
@@ -414,6 +436,27 @@ export class ConversationController extends ObservableStore<ConversationState> {
   private resetAcknowledgements(): void {
     this.acknowledging = false; this.followUp = false; this.suppressed = false
     this.inFlight = null; this.acknowledged = null; this.unacknowledgeable.clear()
+    this.openedVersion = undefined; this.pendingClear = null; this.rendered = false
+  }
+  /** Capture the caller's private state for this open from the DTO's self-only `membership` (absent on a
+   * 0.6 backend: acknowledgements then carry no version and nothing is ever cleared without one).
+   */
+  private capture(conversation: Conversation): void {
+    const membership = conversation.membership
+    this.openedVersion = membership?.privateStateVersion
+    this.pendingClear = membership && membership.unreadMarkedAt !== null ? membership.privateStateVersion : null
+  }
+  /** An opened room that was marked unread and rendered nothing has no target to acknowledge, so it clears
+   * the marker through the adapter instead, conditionally on the captured version and once per open; a
+   * `cleared: false` answer (the marker moved on) is not an error, and adapters without the member keep it.
+   */
+  private async clearMarker(generation: number): Promise<void> {
+    const version = this.pendingClear
+    const clear = this.options.client.clearConversationUnread
+    if (version === null || this.rendered || !clear) return
+    this.pendingClear = null
+    try { await clear.call(this.options.client, this.conversationId, { ifVersion: version }) }
+    catch (error) { if (this.current(generation)) { this.error = error; this.emit() } }
   }
   private assertRows(rows: readonly Message[]): void {
     if (rows.length > Math.max(this.messagePageSize, this.messages.size, this.messagePageSize) ||
