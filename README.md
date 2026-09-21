@@ -21,8 +21,8 @@ All major rows and states accept render callbacks, and `ConvoKitUiProvider`
 provides platform-neutral theme tokens.
 
 Pagination, optimistic sends, realtime reconciliation, deletion tombstones,
-typing indicators, read receipts, and media rendering live in shared
-controllers. Navigation, safe areas, pickers, downloads, and attachment
+edit mode for the caller's own messages, typing indicators, read receipts, and
+media rendering live in shared controllers. Navigation, safe areas, pickers, downloads, and attachment
 opening stay behind application callbacks. This package deliberately imports
 neither Expo modules nor app-specific native libraries, keeping a future
 `react-native-web` target open.
@@ -212,6 +212,105 @@ Mixed fleet: a 0.6 list ignores `isUnread` and shows no dot; a 0.7 list against
 a 0.6 backend derives `isUnread` from the count with no marker, and the
 `/unread` calls fail with status 404.
 
-Version 0.7.0 requires `@convokitapp/react-native` 0.7.x (peer
-`>=0.7.0 <0.8.0`). Publish `@convokitapp/react-native` before publishing this
+## Edit and delete your own messages
+
+Since 0.8 a user can edit the text of their own messages and delete them. It
+needs the 0.8 backend and `@convokitapp/react-native` 0.8. Rows carry the
+core's `Message.revision` (0 when sent, +1 on every edit); `revision > 0` is
+the only edited signal and the default rows show `Edited` beside the time.
+Consumer-built `Message` literals gain `revision: 0`.
+
+Controller members. `ConversationController` (and `useConvoKitConversation`)
+owns edit mode. `ConversationState` carries `editingMessage`, the snapshot of
+the caller's message being edited (null outside edit mode), and
+`canEditMessages` / `canDeleteMessages`, whether the adapter implements the
+0.8 members. `startEditing(messageId)` enters edit mode on one of the caller's
+own confirmed rows and is a no-op for foreign, pending, removed or unknown
+rows, for a `READ` role when the conversation reports one (the self-only
+`membership`, else the caller's `participants` entry) and without adapter
+support; `cancelEditing()` leaves it. `saveEdit(text)` trims the text (empty
+becomes `null`, which clears the caption of a message with attachments; a
+text-only message is never saved empty and sends nothing) and calls the
+adapter with the snapshot's `revision`, captured when editing began, never the
+live row's. Success merges the response under the deletion and precedence
+guards, leaves edit mode and resolves `true`. A stale revision (409
+`REVISION_CONFLICT`) reloads the row once: the row shows the other content,
+the snapshot is refreshed so the next save carries the fresh revision,
+`error` carries the conflict and the composer keeps the edited text. The same
+conflict state is entered without a request whenever a row for the edited id
+with a higher revision reaches the store (an UPDATE image, a hydration, a
+reconcile), except while that row's own save is in flight: its images merge
+and wait for the response (a success ends edit mode; any other failure
+re-checks the row). A save or reload that answers 404 with code `MESSAGE_NOT_FOUND`
+removes the row and leaves edit mode; any other failure (403, network, a 0.7
+backend's uncoded 404) sets `error` and keeps the row and the session; every
+failure resolves `false`. `deleteMessage(messageId)` removes the row only once
+the adapter resolves or answers `MESSAGE_NOT_FOUND` (tombstone first, so late
+edit responses, row images and hydrations for the id are dropped and the read
+acknowledgement re-targets), leaves edit mode when it was that row and
+resolves `true`; other failures keep the row, set `error` and resolve
+`false`. A remote `message_deleted` for the edited row, or a `refresh()` whose
+page no longer carries it, leaves edit mode.
+
+Row precedence: when two rows for one id both carry a usable `revision` and
+they differ, the higher one wins and a lower one never overwrites, so a late
+edit response, or a `refresh()` page fetched before an edit, never rewinds a
+newer live row; equal revisions, pending rows
+and rows from a 0.7 backend keep the `updatedAt ?? createdAt` rule.
+
+Default rows. A row is eligible when the view was given `onEditMessage` /
+`onDeleteMessage`, the row is the caller's own and confirmed, and the caller's
+role is not `READ`. An eligible row is wrapped in a long-pressable with the
+`Message actions` accessibility action (and hint); a long press opens an
+`Alert` sheet with `Edit message`, `Delete message` and `Cancel`, and deleting
+confirms with `Delete this message?` (`Delete` / `Cancel`; dismissing
+declines). Pass `confirmDelete(message)` (resolving a boolean) to replace the
+dialog, and `canEditMessage(message)` to replace the own/role rule for both
+actions (pending rows stay ineligible). Rows that are not eligible, and every
+row without the callbacks, render exactly as in 0.7.
+
+Default composer. While `editingMessage` is set the composer is in edit mode:
+the unsent draft is stashed and the field is prefilled with the message text
+without a typing update, a banner (a polite live region) reads
+`Editing message` with the original text beside `Cancel` (accessible name
+`Cancel editing`), and the primary action reads `Save` with the accessible
+name `Save message` (`Send message` otherwise). Save is enabled while the
+trimmed field is non-empty or the edited message has attachments, so a caption
+can be cleared. Cancel and a successful save restore the stash and report
+typing for it; a failed save keeps the text and edit mode; when the host
+leaves edit mode externally (the row was removed) the field keeps user-changed
+text and restores the stash only when it is empty or unchanged. Custom
+composers receive the additive `editing` (the message) and `cancelEdit` on the
+`renderComposer` input (`ComposerContext`) while editing; `send()` saves then,
+so no branching is needed.
+
+Controlled views. `ConvoKitMessageListView` accepts `onEditMessage(message)`,
+`onDeleteMessage(message)` (`false` reports that nothing was deleted),
+`canEditMessage` and `confirmDelete`; `ConvoKitConversationView` adds
+`editingMessage`, `onSaveEdit(message, text)` (`false` keeps edit mode and the
+text, like `onSendMessage`) and `onCancelEdit`. Without the callbacks nothing
+new renders. Custom rows receive `isEdited`, `canEdit`, `canDelete` and, only
+while allowed, `edit()` and `remove()` (confirms, then calls
+`onDeleteMessage`; resolves whether it was deleted) on `MessageRowContext`.
+The bound `ConvoKitConversation` wires the controller (`editingMessage`,
+`startEditing`, `saveEdit`, `cancelEditing`, `deleteMessage`) only when the
+adapter supports the members and passes `confirmDelete` and `canEditMessage`
+through.
+
+0.8.0 adapter change (additive): `ConvoKitUiClient` gains the optional
+`editMessage(messageId, { text, revision })` (both keys always sent; a stale
+revision must reject with an error whose `code` is `REVISION_CONFLICT`, a
+message the server no longer knows with `MESSAGE_NOT_FOUND`) and
+`deleteMessage(messageId)`; `DefaultConvoKitUiClient` implements both.
+Adapters without them keep compiling: no action renders and the two controller
+methods reject.
+
+Attachments are kept as they are by an edit and are not retracted by a delete
+for members who already received them. Mixed fleet: a 0.7 view ignores
+`revision` and shows no actions; a 0.8 view against a 0.7 backend renders the
+actions but every save and delete fails with an uncoded 404 that keeps the
+row and the draft.
+
+Version 0.8.0 requires `@convokitapp/react-native` 0.8.x (peer
+`>=0.8.0 <0.9.0`). Publish `@convokitapp/react-native` before publishing this
 package.

@@ -40,6 +40,19 @@ export interface ConvoKitUiClient {
    * room controller opened on a marked, empty room leaves the marker in place.
    */
   clearConversationUnread?(id: string, options?: ClearConversationUnreadOptions): Promise<ClearUnreadResult>
+  /** The 0.8 author edit: replace the text of one of the caller's own messages, or clear the caption of a
+   * message with attachments with `text: null`; both keys are always sent. `revision` is the row's
+   * `Message.revision` as the user saw it, and a stale one must reject with an error whose `code` is
+   * `REVISION_CONFLICT` (status 409); a message the server no longer knows with `code` `MESSAGE_NOT_FOUND`.
+   * Optional so 0.7 adapters keep compiling: without it the room controller reports
+   * `canEditMessages: false`, renders no edit action and `saveEdit` rejects.
+   */
+  editMessage?(messageId: string, input: { text: string | null; revision: number }): Promise<Message>
+  /** The 0.8 author delete of one of the caller's own messages. A message that is already gone must reject
+   * with `code` `MESSAGE_NOT_FOUND`. Optional; without it `canDeleteMessages` is false and `deleteMessage`
+   * rejects.
+   */
+  deleteMessage?(messageId: string): Promise<void>
   sendTyping(input: { conversationId: string; isTyping: boolean }): Promise<void>
   onConnectionEvent(handler: (event: RealtimeConnectionEvent) => void, ended: () => void): RealtimeSubscription
   onInboxChanged(handler: () => void): RealtimeSubscription
@@ -68,6 +81,10 @@ export class DefaultConvoKitUiClient implements ConvoKitUiClient {
   clearConversationUnread(id: string, options?: ClearConversationUnreadOptions) {
     return this.sdk.clearConversationUnread(id, options ?? {})
   }
+  editMessage(messageId: string, input: { text: string | null; revision: number }) {
+    return this.sdk.editMessage(messageId, input)
+  }
+  deleteMessage(messageId: string) { return this.sdk.deleteMessage(messageId) }
   sendTyping(input: { conversationId: string; isTyping: boolean }) { return this.sdk.sendTyping(input) }
   onConnectionEvent(handler: (event: RealtimeConnectionEvent) => void, ended: () => void) {
     return this.sdk.realtime.onConnectionEvent({ onEvent: handler, onSessionEnded: ended })

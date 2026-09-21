@@ -33,7 +33,8 @@ export function mergeInboxEntries(
   return { conversations: [...byId.values()].sort(compareInboxActivity(merged)), summaries: merged }
 }
 
-function previewBody(message: Message): string {
+/** A message body for one-line surfaces: the trimmed text, else a word for the first attachment. */
+export function previewBody(message: Message): string {
   const text = message.text?.trim()
   if (text) return text
   const media = message.media[0]

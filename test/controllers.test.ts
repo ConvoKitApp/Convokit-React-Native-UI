@@ -27,7 +27,7 @@ const conversation: Conversation = {
 const at = (seconds: number) => new Date(Date.UTC(2026, 7, 1, 11, 0, seconds))
 const message = (id: string, senderId: string, createdAt: Date, text: string | null = `text ${id}`): Message => ({
   id, conversationId: 'room', senderId, clientMessageId: null, text, media: text ? [] : [{ type: 'image', url: `https://cdn/${id}` }],
-  createdAt, updatedAt: null,
+  createdAt, updatedAt: null, revision: 0,
 })
 const position = (row: Message): ReadPosition => ({ messageId: row.id, createdAt: row.createdAt })
 /** The caller's own row as a 0.7 backend serves it beside the conversation; marked when `unreadMarkedAt` is set. */
@@ -42,10 +42,14 @@ function deferred<T = void>() {
   return { promise, resolve, reject }
 }
 
+const conflict = () => Object.assign(new Error('Message was changed since it was loaded'), { status: 409, code: 'REVISION_CONFLICT' })
+const missing = () => Object.assign(new Error('Message not found'), { status: 404, code: 'MESSAGE_NOT_FOUND' })
+
 /** `membership` makes `getConversation` answer like a 0.7 backend; `unread: false` builds a 0.6 adapter without
- * the optional mark/clear members.
+ * the optional mark/clear members; `edits: false` a 0.7 adapter without the author edit/delete members. The
+ * 0.8 members act on `rows` like the backend: a stale revision is a 409, an unknown id a coded 404.
  */
-function client(rows: Message[] = [], participants: Participant[] = [], options: { membership?: ConversationMembership; unread?: boolean } = {}) {
+function client(rows: Message[] = [], participants: Participant[] = [], options: { membership?: ConversationMembership; unread?: boolean; edits?: boolean } = {}) {
   const session = {}
   const handlers: {
     message?: (event: MessageEvent) => void
@@ -65,7 +69,7 @@ function client(rows: Message[] = [], participants: Participant[] = [], options:
     sendMessage: vi.fn(async input => ({
       id: 'message-1', conversationId: input.conversationId, senderId: 'me',
       clientMessageId: input.clientMessageId, text: input.text ?? null, media: input.media ?? [],
-      createdAt: new Date(), updatedAt: null,
+      createdAt: new Date(), updatedAt: null, revision: 0,
     } satisfies Message)),
     markConversationRead: vi.fn().mockResolvedValue(undefined),
     ...(options.unread === false ? {} : {
@@ -73,6 +77,22 @@ function client(rows: Message[] = [], participants: Participant[] = [], options:
         ({ conversationId: id, unreadMarkedAt: at(60), privateStateVersion: 1 })),
       clearConversationUnread: vi.fn(async (id: string, clear?: ClearConversationUnreadOptions): Promise<ClearUnreadResult> =>
         ({ conversationId: id, cleared: true, unreadMarkedAt: null, privateStateVersion: (clear?.ifVersion ?? 0) + 1 })),
+    }),
+    ...(options.edits === false ? {} : {
+      editMessage: vi.fn(async (id: string, input: { text: string | null; revision: number }): Promise<Message> => {
+        const index = rows.findIndex(candidate => candidate.id === id)
+        const row = rows[index]
+        if (!row) throw missing()
+        if (row.revision !== input.revision) throw conflict()
+        const next = { ...row, text: input.text, revision: row.revision + 1, updatedAt: at(50 + row.revision) }
+        rows[index] = next
+        return next
+      }),
+      deleteMessage: vi.fn(async (id: string): Promise<void> => {
+        const index = rows.findIndex(candidate => candidate.id === id)
+        if (index === -1) throw missing()
+        rows.splice(index, 1)
+      }),
     }),
     sendTyping: vi.fn().mockResolvedValue(undefined),
     onConnectionEvent: vi.fn(close), onInboxChanged: vi.fn(close),
@@ -574,6 +594,350 @@ describe('private unread marker', () => {
     expect(legacy.acks()).toEqual([])
     expect(older.getSnapshot().error).toBeNull()
     await controller.dispose(); await older.dispose()
+  })
+})
+
+describe('message edits', () => {
+  const failure = (status: number, code?: string) => Object.assign(new Error(`HTTP ${status}`), { status, ...(code ? { code } : {}) })
+  const open = async (rows: Message[], options: Parameters<typeof client>[2] = {}, participants: Participant[] = []) => {
+    const fixture = client(rows, participants, options)
+    const controller = new ConversationController({ conversationId: 'room', client: fixture.sdk, autoLoad: false, markReadOnLoad: false })
+    await controller.loadInitial()
+    return { ...fixture, controller }
+  }
+  const edits = (sdk: ConvoKitUiClient) => vi.mocked(sdk.editMessage!).mock.calls.map(([id, input]) => [id, input])
+  const row = (controller: ConversationController, id: string) => controller.getSnapshot().messages.find(candidate => candidate.id === id)
+  const ids = (controller: ConversationController) => controller.getSnapshot().messages.map(candidate => candidate.id)
+  const code = (controller: ConversationController) => (controller.getSnapshot().error as { code?: string } | null)?.code
+
+  it('reports adapter support and enters edit mode only for own confirmed rows', async () => {
+    const mine = message('m1', 'me', at(10)), theirs = message('m2', 'alex', at(20))
+    const { sdk, controller } = await open([mine, theirs])
+    expect(controller.getSnapshot()).toMatchObject({ canEditMessages: true, canDeleteMessages: true, editingMessage: null })
+    controller.startEditing('m2')
+    expect(controller.getSnapshot().editingMessage).toBeNull()
+    controller.startEditing('missing')
+    expect(controller.getSnapshot().editingMessage).toBeNull()
+    const send = deferred<Message>()
+    vi.mocked(sdk.sendMessage).mockReturnValueOnce(send.promise)
+    const sending = controller.sendMessage({ text: 'Hello' })
+    const pending = controller.getSnapshot().messages.find(candidate => candidate.id.startsWith('convokit-pending-'))!
+    controller.startEditing(pending.id)
+    expect(controller.getSnapshot().editingMessage).toBeNull()
+    expect(await controller.deleteMessage(pending.id)).toBe(false)
+    expect(await controller.deleteMessage('m2')).toBe(false)
+    expect(sdk.deleteMessage).not.toHaveBeenCalled()
+    send.resolve(message('m3', 'me', at(30)))
+    await sending
+    const typingCalls = vi.mocked(sdk.sendTyping).mock.calls.length
+    controller.startEditing('m1')
+    expect(controller.getSnapshot().editingMessage).toEqual(mine)
+    expect(vi.mocked(sdk.sendTyping).mock.calls).toHaveLength(typingCalls)
+    controller.cancelEditing()
+    expect(controller.getSnapshot().editingMessage).toBeNull()
+    expect(sdk.editMessage).not.toHaveBeenCalled()
+    await controller.dispose()
+  })
+
+  it('never enters edit mode for a READ role or without the adapter members', async () => {
+    const reader = await open([message('m1', 'me', at(10))], { membership: { ...membership(1), role: 'READ' } })
+    reader.controller.startEditing('m1')
+    expect(reader.controller.getSnapshot().editingMessage).toBeNull()
+    const listed = await open([message('m1', 'me', at(10))], {}, [{ ...participant('me'), role: 'READ' }])
+    listed.controller.startEditing('m1')
+    expect(listed.controller.getSnapshot().editingMessage).toBeNull()
+    const legacy = await open([message('m1', 'me', at(10))], { edits: false })
+    expect(legacy.controller.getSnapshot()).toMatchObject({ canEditMessages: false, canDeleteMessages: false })
+    legacy.controller.startEditing('m1')
+    expect(legacy.controller.getSnapshot().editingMessage).toBeNull()
+    await expect(legacy.controller.saveEdit('x')).rejects.toThrow('This ConvoKitUiClient adapter does not implement editMessage (0.8)')
+    await expect(legacy.controller.deleteMessage('m1')).rejects.toThrow('This ConvoKitUiClient adapter does not implement deleteMessage (0.8)')
+    expect(legacy.controller.getSnapshot().messages).toHaveLength(1)
+    await reader.controller.dispose(); await listed.controller.dispose(); await legacy.controller.dispose()
+  })
+
+  it('sends the snapshot revision even after a same-revision update advanced the live row', async () => {
+    const original = message('m1', 'me', at(10))
+    const { sdk, controller, live } = await open([original])
+    controller.startEditing('m1')
+    await live.insert({ ...original, text: 'echo', updatedAt: at(11) }, 'update')
+    expect(row(controller, 'm1')?.text).toBe('echo')
+    expect(controller.getSnapshot().editingMessage).toEqual(original)
+    await expect(controller.saveEdit('  mine  ')).resolves.toBe(true)
+    expect(edits(sdk)).toEqual([['m1', { text: 'mine', revision: 0 }]])
+    expect(row(controller, 'm1')).toMatchObject({ text: 'mine', revision: 1 })
+    expect(controller.getSnapshot()).toMatchObject({ editingMessage: null, error: null })
+    expect(sdk.sendTyping).not.toHaveBeenCalled()
+    // The row's own UPDATE image arrives late with the same revision: nothing changes.
+    await live.insert({ ...row(controller, 'm1')!, media: [] }, 'update')
+    expect(row(controller, 'm1')).toMatchObject({ text: 'mine', revision: 1 })
+    expect(edits(sdk)).toHaveLength(1)
+    await controller.dispose()
+  })
+
+  it('clears a caption with null and keeps the media byte-identical', async () => {
+    const photo = message('m1', 'me', at(10), null)
+    const media = photo.media
+    const { sdk, controller, live } = await open([photo])
+    controller.startEditing('m1')
+    await expect(controller.saveEdit('   ')).resolves.toBe(true)
+    expect(edits(sdk)).toEqual([['m1', { text: null, revision: 0 }]])
+    expect(row(controller, 'm1')).toMatchObject({ text: null, revision: 1 })
+    expect(row(controller, 'm1')?.media).toEqual(media)
+    expect(controller.getSnapshot().editingMessage).toBeNull()
+    // The row image of the same edit (no media on the wire) is hydrated before it is applied: no flicker.
+    const saved = row(controller, 'm1')!
+    vi.mocked(sdk.getMessage).mockResolvedValueOnce(saved)
+    await live.insert({ ...saved, media: [] }, 'update')
+    expect(row(controller, 'm1')).toEqual(saved)
+    expect(row(controller, 'm1')?.media).toEqual(media)
+    await controller.dispose()
+  })
+
+  it('never saves a text-only message empty', async () => {
+    const { sdk, controller } = await open([message('m1', 'me', at(10))])
+    controller.startEditing('m1')
+    await expect(controller.saveEdit('   ')).resolves.toBe(false)
+    expect(sdk.editMessage).not.toHaveBeenCalled()
+    expect(controller.getSnapshot()).toMatchObject({ editingMessage: { id: 'm1' }, error: null })
+    await controller.dispose()
+  })
+
+  it('reloads once on a 409, refreshes the snapshot and saves with the fresh revision next', async () => {
+    const original = message('m1', 'me', at(10))
+    const { sdk, controller, rows } = await open([original])
+    controller.startEditing('m1')
+    const theirs = { ...original, text: 'theirs', revision: 1, updatedAt: at(20) }
+    rows[0] = theirs
+    const fetches = vi.mocked(sdk.getMessage).mock.calls.length
+    await expect(controller.saveEdit('mine')).resolves.toBe(false)
+    expect(edits(sdk)).toEqual([['m1', { text: 'mine', revision: 0 }]])
+    expect(vi.mocked(sdk.getMessage).mock.calls.length - fetches).toBe(1)
+    expect(row(controller, 'm1')).toEqual(theirs)
+    expect(controller.getSnapshot().editingMessage).toEqual(theirs)
+    expect(code(controller)).toBe('REVISION_CONFLICT')
+    await expect(controller.saveEdit('mine')).resolves.toBe(true)
+    expect(edits(sdk)[1]).toEqual(['m1', { text: 'mine', revision: 1 }])
+    expect(row(controller, 'm1')).toMatchObject({ text: 'mine', revision: 2 })
+    expect(controller.getSnapshot()).toMatchObject({ editingMessage: null, error: null })
+    await controller.dispose()
+  })
+
+  it('enters the conflict state locally when a newer row image arrives while editing', async () => {
+    const original = message('m1', 'me', at(10))
+    const { sdk, controller, live, rows } = await open([original])
+    controller.startEditing('m1')
+    const theirs = { ...original, text: 'theirs', revision: 1, updatedAt: at(20) }
+    await live.insert(theirs, 'update')
+    expect(sdk.editMessage).not.toHaveBeenCalled()
+    expect(row(controller, 'm1')).toEqual(theirs)
+    expect(controller.getSnapshot().editingMessage).toEqual(theirs)
+    expect(code(controller)).toBe('REVISION_CONFLICT')
+    // A refresh that brings a newer revision is a conflict too; a stale re-delivery never rewinds the row.
+    const newest = { ...theirs, text: 'newer', revision: 2 }
+    vi.mocked(sdk.getMessages).mockResolvedValueOnce([newest])
+    await controller.refresh()
+    expect(controller.getSnapshot().editingMessage).toEqual(newest)
+    await live.insert(original, 'update')
+    expect(row(controller, 'm1')).toEqual(newest)
+    rows[0] = newest
+    await expect(controller.saveEdit('mine')).resolves.toBe(true)
+    expect(edits(sdk)).toEqual([['m1', { text: 'mine', revision: 2 }]])
+    await controller.dispose()
+  })
+
+  it('removes the row and leaves edit mode when the conflict reload reports it deleted', async () => {
+    const { sdk, controller } = await open([message('m1', 'me', at(10)), message('m2', 'alex', at(20))])
+    controller.startEditing('m1')
+    vi.mocked(sdk.editMessage!).mockRejectedValueOnce(conflict())
+    vi.mocked(sdk.getMessage).mockRejectedValueOnce(missing())
+    await expect(controller.saveEdit('mine')).resolves.toBe(false)
+    expect(ids(controller)).toEqual(['m2'])
+    expect(controller.getSnapshot().editingMessage).toBeNull()
+    expect(code(controller)).toBe('MESSAGE_NOT_FOUND')
+    // A reload that fails otherwise keeps the snapshot and surfaces that failure.
+    const other = await open([message('m1', 'me', at(10))])
+    other.controller.startEditing('m1')
+    vi.mocked(other.sdk.editMessage!).mockRejectedValueOnce(conflict())
+    vi.mocked(other.sdk.getMessage).mockRejectedValueOnce(failure(500))
+    await expect(other.controller.saveEdit('mine')).resolves.toBe(false)
+    expect(other.controller.getSnapshot().editingMessage).toMatchObject({ id: 'm1', revision: 0 })
+    expect(other.controller.getSnapshot().error).toEqual(failure(500))
+    expect(ids(other.controller)).toEqual(['m1'])
+    await controller.dispose(); await other.controller.dispose()
+  })
+
+  it('keeps the session, the row and history on network, 500 and 403 failures', async () => {
+    const original = message('m1', 'me', at(10))
+    const { sdk, controller } = await open([original, message('m2', 'alex', at(20))])
+    controller.startEditing('m1')
+    for (const error of [new Error('offline'), failure(500), failure(403)]) {
+      vi.mocked(sdk.editMessage!).mockRejectedValueOnce(error)
+      await expect(controller.saveEdit('mine')).resolves.toBe(false)
+      expect(controller.getSnapshot().error).toBe(error)
+      expect(controller.getSnapshot().editingMessage).toEqual(original)
+      expect(ids(controller)).toEqual(['m1', 'm2'])
+    }
+    expect(edits(sdk)).toHaveLength(3)
+    await controller.dispose()
+  })
+
+  it('leaves edit mode when the edited row is deleted remotely', async () => {
+    const { controller, live } = await open([message('m1', 'me', at(10))])
+    controller.startEditing('m1')
+    await live.remove('m1')
+    expect(controller.getSnapshot()).toMatchObject({ editingMessage: null, messages: [] })
+    await controller.dispose()
+  })
+
+  it('treats a coded 404 as a deletion and an uncoded 404 as a plain failure', async () => {
+    const coded = await open([message('m1', 'me', at(10)), message('m2', 'alex', at(20))])
+    coded.controller.startEditing('m1')
+    vi.mocked(coded.sdk.editMessage!).mockRejectedValueOnce(missing())
+    await expect(coded.controller.saveEdit('mine')).resolves.toBe(false)
+    expect(ids(coded.controller)).toEqual(['m2'])
+    expect(coded.controller.getSnapshot().editingMessage).toBeNull()
+    expect(code(coded.controller)).toBe('MESSAGE_NOT_FOUND')
+    // A 0.7 backend answers the unmatched `/own` route with an HTML 404 without a code.
+    const legacy = await open([message('m1', 'me', at(10))])
+    legacy.controller.startEditing('m1')
+    const html = Object.assign(new Error('HTTP 404'), { status: 404, code: 'HTTP_ERROR' })
+    vi.mocked(legacy.sdk.editMessage!).mockRejectedValueOnce(html)
+    await expect(legacy.controller.saveEdit('mine')).resolves.toBe(false)
+    expect(ids(legacy.controller)).toEqual(['m1'])
+    expect(legacy.controller.getSnapshot()).toMatchObject({ editingMessage: { id: 'm1' }, error: html })
+    await coded.controller.dispose(); await legacy.controller.dispose()
+  })
+
+  it('deletes through the adapter, tombstones the row and drops every late answer for it', async () => {
+    const mine = message('m2', 'me', at(20))
+    const { sdk, controller, live, targets } = await open([message('m1', 'alex', at(10)), mine])
+    await controller.markRead()
+    expect(targets()).toEqual(['m2'])
+    controller.startEditing('m2')
+    const edit = deferred<Message>()
+    vi.mocked(sdk.editMessage!).mockReturnValueOnce(edit.promise)
+    const saving = controller.saveEdit('mine')
+    await expect(controller.deleteMessage('m2')).resolves.toBe(true)
+    expect(sdk.deleteMessage).toHaveBeenCalledWith('m2')
+    expect(ids(controller)).toEqual(['m1'])
+    expect(controller.getSnapshot().editingMessage).toBeNull()
+    // The removed acknowledgement target falls back to the next newest row once.
+    expect(targets()).toEqual(['m2', 'm1'])
+    edit.resolve({ ...mine, text: 'mine', revision: 1 })
+    await saving
+    expect(ids(controller)).toEqual(['m1'])
+    await live.insert({ ...mine, text: 'mine', revision: 1 }, 'update')
+    await live.insert(mine, 'insert')
+    expect(ids(controller)).toEqual(['m1'])
+    const before = targets().length
+    await live.remove('m2')
+    expect(ids(controller)).toEqual(['m1'])
+    expect(targets()).toHaveLength(before)
+    expect(controller.getSnapshot().error).toBeNull()
+    await controller.dispose()
+  })
+
+  it('removes the row on a delete that answers MESSAGE_NOT_FOUND and keeps it on other failures', async () => {
+    const { sdk, controller } = await open([message('m1', 'me', at(10))])
+    for (const error of [failure(404), failure(500)]) {
+      vi.mocked(sdk.deleteMessage!).mockRejectedValueOnce(error)
+      await expect(controller.deleteMessage('m1')).resolves.toBe(false)
+      expect(ids(controller)).toEqual(['m1'])
+      expect(controller.getSnapshot().error).toBe(error)
+    }
+    controller.startEditing('m1')
+    vi.mocked(sdk.deleteMessage!).mockRejectedValueOnce(missing())
+    await expect(controller.deleteMessage('m1')).resolves.toBe(true)
+    expect(controller.getSnapshot()).toMatchObject({ messages: [], editingMessage: null, error: null })
+    await controller.dispose()
+  })
+
+  it('never reads the in-flight save\'s own row image as a conflict, and re-checks after a failed save', async () => {
+    const original = message('m1', 'me', at(10))
+    const { sdk, controller, live } = await open([original])
+    controller.startEditing('m1')
+    const edit = deferred<Message>()
+    vi.mocked(sdk.editMessage!).mockReturnValueOnce(edit.promise)
+    const saving = controller.saveEdit('mine')
+    // The edit's UPDATE image (revision 1) beats the PATCH response: the row updates, no conflict is raised.
+    const saved = { ...original, text: 'mine', revision: 1, updatedAt: at(50) }
+    await live.insert(saved, 'update')
+    expect(row(controller, 'm1')).toEqual(saved)
+    expect(controller.getSnapshot()).toMatchObject({ editingMessage: original, error: null })
+    edit.resolve(saved)
+    await expect(saving).resolves.toBe(true)
+    expect(controller.getSnapshot()).toMatchObject({ editingMessage: null, error: null })
+    // A newer row image that arrives during a save that then fails is a conflict after all.
+    controller.startEditing('m1')
+    const failing = deferred<Message>()
+    vi.mocked(sdk.editMessage!).mockReturnValueOnce(failing.promise)
+    const retry = controller.saveEdit('again')
+    const theirs = { ...saved, text: 'theirs', revision: 2, updatedAt: at(60) }
+    await live.insert(theirs, 'update')
+    expect(controller.getSnapshot()).toMatchObject({ editingMessage: saved, error: null })
+    failing.reject(new Error('offline'))
+    await expect(retry).resolves.toBe(false)
+    expect(controller.getSnapshot().editingMessage).toEqual(theirs)
+    expect(code(controller)).toBe('REVISION_CONFLICT')
+    expect(row(controller, 'm1')).toEqual(theirs)
+    await controller.dispose()
+  })
+
+  it('never lets a stale refresh page rewind a newer edited row', async () => {
+    const original = message('m1', 'me', at(10))
+    const { sdk, controller } = await open([original])
+    const page = deferred<Message[]>()
+    vi.mocked(sdk.getMessages).mockReturnValueOnce(page.promise)
+    const refreshing = controller.refresh()
+    controller.startEditing('m1')
+    await expect(controller.saveEdit('mine')).resolves.toBe(true)
+    expect(row(controller, 'm1')).toMatchObject({ text: 'mine', revision: 1 })
+    // The page was fetched before the edit: revision 0 never overwrites revision 1.
+    page.resolve([original])
+    await refreshing
+    expect(row(controller, 'm1')).toMatchObject({ text: 'mine', revision: 1 })
+    expect(controller.getSnapshot()).toMatchObject({ editingMessage: null, error: null, isReconciling: false })
+    await controller.dispose()
+  })
+
+  it('leaves edit mode when a refresh no longer carries the edited row', async () => {
+    const { sdk, controller, rows } = await open([message('m1', 'me', at(10)), message('m2', 'alex', at(20))])
+    controller.startEditing('m1')
+    rows.splice(0, 1)
+    await controller.refresh()
+    expect(ids(controller)).toEqual(['m2'])
+    expect(controller.getSnapshot()).toMatchObject({ editingMessage: null, error: null })
+    // A refresh that still carries the row keeps the session.
+    rows.push(message('m3', 'me', at(30)))
+    await controller.refresh()
+    controller.startEditing('m2')
+    expect(controller.getSnapshot().editingMessage).toBeNull()
+    controller.startEditing('m3')
+    await controller.refresh()
+    expect(controller.getSnapshot().editingMessage).toMatchObject({ id: 'm3', revision: 0 })
+    expect(code(controller)).toBeUndefined()
+    expect(sdk.editMessage).not.toHaveBeenCalled()
+    await controller.dispose()
+  })
+
+  it('never lets a revision 2 response overwrite a live revision 3 row', async () => {
+    const original = { ...message('m1', 'me', at(10)), revision: 1 }
+    const { sdk, controller, live } = await open([original])
+    controller.startEditing('m1')
+    const edit = deferred<Message>()
+    vi.mocked(sdk.editMessage!).mockReturnValueOnce(edit.promise)
+    const saving = controller.saveEdit('mine')
+    const newest = { ...original, text: 'theirs', revision: 3, updatedAt: at(30) }
+    await live.insert(newest, 'update')
+    // The row shows the newer content at once; the in-flight save's snapshot waits for the response.
+    expect(row(controller, 'm1')).toEqual(newest)
+    expect(controller.getSnapshot()).toMatchObject({ editingMessage: original, error: null })
+    edit.resolve({ ...original, text: 'mine', revision: 2, updatedAt: at(40) })
+    await expect(saving).resolves.toBe(true)
+    expect(row(controller, 'm1')).toEqual(newest)
+    expect(controller.getSnapshot()).toMatchObject({ editingMessage: null, error: null })
+    await controller.dispose()
   })
 })
 

@@ -31,6 +31,16 @@ export interface ConversationState {
   hasOlderMessages: boolean
   hasLoaded: boolean
   error: unknown
+  /** The 0.8 edit session: the snapshot of the caller's own message being edited, captured by
+   * `startEditing` and refreshed only by a conflict; its `revision` is what `saveEdit` sends. Null
+   * outside edit mode; cleared when that row is removed.
+   */
+  editingMessage: Message | null
+  /** Whether the adapter implements the 0.8 `editMessage` / `deleteMessage`; without them nothing renders
+   * an edit or delete action and `startEditing` is a no-op.
+   */
+  canEditMessages: boolean
+  canDeleteMessages: boolean
 }
 
 export interface ConversationControllerOptions {
@@ -54,10 +64,23 @@ function sortMessages(messages: Iterable<Message>): Message[] {
   return [...messages].sort(compareCursor)
 }
 
+/** Row precedence: when both rows carry a usable revision and they differ, the higher one wins and a lower
+ * one never overwrites; equal revisions (and rows without one: pending rows, 0.7 backends where every row
+ * is 0) fall back to the later `updatedAt ?? createdAt`, ties to the incoming row.
+ */
 function newer(left: Message, right: Message): Message {
+  if (usableRevision(left) && usableRevision(right) && left.revision !== right.revision) {
+    return right.revision > left.revision ? right : left
+  }
   const leftTime = (left.updatedAt ?? left.createdAt).getTime()
   const rightTime = (right.updatedAt ?? right.createdAt).getTime()
   return rightTime >= leftTime ? right : left
+}
+/** A revision takes part in precedence only as a non-negative integer; consumer-built rows without one keep
+ * the timestamp rule. Two usable revisions that differ always include one above 0.
+ */
+function usableRevision(row: Message): boolean {
+  return Number.isInteger(row.revision) && row.revision >= 0
 }
 
 function errorField(error: unknown, field: 'code' | 'status'): unknown {
@@ -66,6 +89,14 @@ function errorField(error: unknown, field: 'code' | 'status'): unknown {
 /** A targeted read whose message the server no longer knows; membership failures carry no code. */
 const isTargetMiss = (error: unknown): boolean => errorField(error, 'code') === 'MESSAGE_NOT_FOUND'
 const isNotFound = (error: unknown): boolean => errorField(error, 'status') === 404
+/** A stale-revision rejection of an author edit (the 0.8 backend's 409 `REVISION_CONFLICT`). */
+const isConflict = (error: unknown): boolean =>
+  errorField(error, 'code') === 'REVISION_CONFLICT' || errorField(error, 'status') === 409
+/** The local conflict: a newer row for the edited id reached the store, no request involved. */
+const conflictError = (): Error =>
+  Object.assign(new Error('Message was changed since it was loaded'), { code: 'REVISION_CONFLICT' })
+const unsupported = (member: string): Error =>
+  new Error(`This ConvoKitUiClient adapter does not implement ${member} (0.8)`)
 
 /** Readers of a message under the unified rule: a user's read position when known, otherwise the
  * acknowledgement time. The sender never reads their own message and pending rows have no readers.
@@ -108,6 +139,13 @@ export class ConversationController extends ObservableStore<ConversationState> {
   private error: unknown = null
   private disposed = false
   private sessionIdentity: object | null = null
+  // The 0.8 edit session: the snapshot whose revision every save sends (refreshed only by a conflict), the id
+  // whose save is in flight (its row images wait for the response instead of raising a conflict), and the
+  // adapter support decided once at construction (`listInbox` precedent).
+  private editing: Message | null = null
+  private saving: string | null = null
+  private readonly supportsEdit: boolean
+  private readonly supportsDelete: boolean
   // Acknowledgements: visible until the platform says otherwise, one request in flight, a boolean
   // follow-up resolved at send time, and the ids the server refused so a retry skips them.
   private visible = true
@@ -134,6 +172,8 @@ export class ConversationController extends ObservableStore<ConversationState> {
     if (this.messagePageSize < 1 || this.messagePageSize > 100) {
       throw new RangeError('messagePageSize must be between 1 and 100')
     }
+    this.supportsEdit = typeof options.client.editMessage === 'function'
+    this.supportsDelete = typeof options.client.deleteMessage === 'function'
     if (options.autoLoad !== false) void this.loadInitial()
   }
 
@@ -151,6 +191,9 @@ export class ConversationController extends ObservableStore<ConversationState> {
     hasOlderMessages: this.hasOlder,
     hasLoaded: this.hasLoaded,
     error: this.error,
+    editingMessage: this.editing,
+    canEditMessages: this.supportsEdit,
+    canDeleteMessages: this.supportsDelete,
   })
 
   readerIdsFor(message: Message): ReadonlySet<string> {
@@ -162,7 +205,7 @@ export class ConversationController extends ObservableStore<ConversationState> {
     const generation = ++this.generation
     await this.clearSubscriptions()
     this.messages.clear(); this.deleted.clear(); this.typing.clear(); this.reads.clear(); this.positions.clear()
-    this.resetAcknowledgements()
+    this.resetAcknowledgements(); this.editing = null; this.saving = null
     this.conversation = null; this.error = null; this.hasOlder = true; this.initialLoading = true; this.emit()
     this.sessionIdentity = this.options.client.sessionIdentity
     try {
@@ -201,13 +244,23 @@ export class ConversationController extends ObservableStore<ConversationState> {
       const opening = this.conversation === null
       this.conversation = conversation
       if (opening) this.capture(conversation)
-      const canonical = new Map(page.filter(row => !this.deleted.has(row.id)).map(row => [row.id, row]))
+      // The page is the rendered window, but each row still merges under precedence (D11): a page fetched
+      // before an edit never rewinds the newer row the edit response or its UPDATE image already brought.
+      const canonical = new Map<string, Message>()
+      for (const row of page) {
+        if (this.deleted.has(row.id)) continue
+        const existing = this.messages.get(row.id)
+        canonical.set(row.id, existing ? newer(existing, row) : row)
+      }
       for (const row of this.messages.values()) {
         if (isConvoKitPendingMessage(row)) canonical.set(row.id, row)
       }
       this.messages = canonical
+      // A row the page no longer carries is no longer rendered: its edit session ends with it.
+      if (this.editing && !canonical.has(this.editing.id)) this.editing = null
       this.mergeParticipantReads(conversation)
       this.error = null
+      this.detectConflict()
     } catch (error) { if (this.current(generation)) this.error = error }
     finally { if (this.current(generation)) { this.reconciling = false; this.emit() } }
   }
@@ -237,7 +290,7 @@ export class ConversationController extends ObservableStore<ConversationState> {
     const pending: Message = {
       id: `${pendingPrefix}${clientMessageId}`, clientMessageId,
       conversationId: this.conversationId, senderId: this.options.client.currentUserId,
-      text: text || null, media, createdAt: new Date(), updatedAt: null,
+      text: text || null, media, createdAt: new Date(), updatedAt: null, revision: 0,
     }
     this.messages.set(pending.id, pending); this.sending = true; this.error = null; this.emit()
     try {
@@ -263,6 +316,94 @@ export class ConversationController extends ObservableStore<ConversationState> {
       }
       return null
     } finally { if (this.current(generation)) { this.sending = false; this.emit() } }
+  }
+
+  /** Enter edit mode on one of the caller's own confirmed messages: the current row becomes the snapshot
+   * whose `revision` every save of this session sends. A no-op for foreign, pending, removed or unknown
+   * rows, for a `READ` role when the conversation reports one, and for adapters without `editMessage`.
+   */
+  startEditing(messageId: string): void {
+    if (!this.supportsEdit || this.disposed) return
+    const row = this.messages.get(messageId)
+    if (!row || !this.editable(row) || this.role() === 'READ') return
+    this.editing = row; this.error = null; this.emit()
+  }
+
+  /** Leave edit mode without a request. */
+  cancelEditing(): void {
+    if (!this.editing) return
+    this.editing = null; this.emit()
+  }
+
+  /** Save the edit session: the trimmed text (empty clears the caption of a message with attachments; a
+   * text-only message is never saved empty, no request) is sent with the snapshot's revision, never the
+   * live row's. Success merges the response under the deletion and precedence guards, clears edit mode
+   * and resolves `true`. A stale revision (409 `REVISION_CONFLICT`) reloads the row once: the row shows
+   * the new content, the snapshot is refreshed so the next save carries the fresh revision, `error`
+   * carries the conflict, and the edited text is left to the composer. A reload or a save that answers
+   * `MESSAGE_NOT_FOUND` removes the row and leaves edit mode. Any other failure (a 0.7 backend's uncoded
+   * 404, 403, network) sets `error` and keeps the row and the session; every failure resolves `false`.
+   * While the save is in flight, row images for the edited id (its own UPDATE image often beats the
+   * response) merge without raising a conflict: a success ends edit mode, a 409 reloads the row, and any
+   * other failure re-checks the rendered row so a genuinely newer one is a conflict after all.
+   */
+  async saveEdit(text: string): Promise<boolean> {
+    const edit = this.options.client.editMessage
+    if (typeof edit !== 'function') throw unsupported('editMessage')
+    const snapshot = this.editing
+    if (!snapshot || this.saving !== null || this.disposed) return false
+    const trimmed = text.trim()
+    const normalized = trimmed === '' ? null : trimmed
+    if (normalized === null && !snapshot.media.length) return false
+    const generation = this.generation
+    const id = snapshot.id
+    this.saving = id; this.error = null; this.emit()
+    try {
+      const row = await edit.call(this.options.client, id, { text: normalized, revision: snapshot.revision })
+      if (!this.current(generation)) return false
+      if (row.id !== id || row.conversationId !== this.conversationId) {
+        throw new Error('Edit response does not match the edited message')
+      }
+      // Leave edit mode first so the response is not read as a conflict against its own snapshot; a late
+      // response for a row removed meanwhile is dropped, edit mode was left with the removal.
+      if (this.editing?.id === id) this.editing = null
+      if (!this.deleted.has(id)) this.store(row)
+      this.error = null
+      return true
+    } catch (error) {
+      if (!this.current(generation) || this.deleted.has(id)) return false
+      this.saving = null
+      if (isConflict(error)) await this.reloadConflict(id, error, generation)
+      else if (isTargetMiss(error)) { this.remove(id); this.error = error }
+      else {
+        this.error = error
+        // A newer row image that arrived during the failed request is a conflict after all.
+        this.detectConflict()
+      }
+      return false
+    } finally { if (this.current(generation)) { this.saving = null; this.emit() } }
+  }
+
+  /** Delete one of the caller's own confirmed messages through the adapter. Success, or a server that no
+   * longer knows the message (`MESSAGE_NOT_FOUND`), tombstones and removes the row (leaving edit mode when
+   * it was that row) and resolves `true`; any other failure sets `error`, keeps the row and resolves
+   * `false`. Never removes a row before the server answers.
+   */
+  async deleteMessage(messageId: string): Promise<boolean> {
+    const remove = this.options.client.deleteMessage
+    if (typeof remove !== 'function') throw unsupported('deleteMessage')
+    const row = this.messages.get(messageId)
+    if (!row || !this.editable(row) || this.disposed) return false
+    const generation = this.generation
+    this.error = null; this.emit()
+    try { await remove.call(this.options.client, messageId) }
+    catch (error) {
+      if (!this.current(generation)) return false
+      if (!isTargetMiss(error)) { this.error = error; this.emit(); return false }
+    }
+    if (!this.current(generation)) return false
+    this.remove(messageId); this.emit()
+    return true
   }
 
   /** Acknowledge through the newest rendered message (clearing the caller's unread marker when the version
@@ -342,8 +483,7 @@ export class ConversationController extends ObservableStore<ConversationState> {
       if (isNotFound(error)) { this.remove(row.id); this.emit(); return }
     }
     if (!this.current(generation) || this.deleted.has(row.id)) return
-    const existing = this.messages.get(row.id)
-    this.messages.set(row.id, existing ? newer(existing, complete) : complete); this.rendered = true
+    this.store(complete)
     if (complete.clientMessageId) {
       for (const candidate of this.messages.values()) {
         if (isConvoKitPendingMessage(candidate) && candidate.clientMessageId === complete.clientMessageId &&
@@ -358,12 +498,59 @@ export class ConversationController extends ObservableStore<ConversationState> {
   private merge(rows: readonly Message[]): void {
     for (const row of rows) {
       if (row.conversationId !== this.conversationId || this.deleted.has(row.id)) continue
-      const existing = this.messages.get(row.id)
-      this.messages.set(row.id, existing ? newer(existing, row) : row); this.rendered = true
+      this.store(row)
     }
+  }
+  /** Keep the newer of the known row and an incoming one (D11), then check the edit session against it. */
+  private store(row: Message): void {
+    const existing = this.messages.get(row.id)
+    this.messages.set(row.id, existing ? newer(existing, row) : row); this.rendered = true
+    this.detectConflict()
+  }
+  /** The local conflict: a row for the edited id with a higher revision than the snapshot (an UPDATE image,
+   * a hydration, a reconcile) enters the same state as a 409 without a round trip. The snapshot is replaced
+   * so the next save carries the fresh revision; the composer keeps its text and edit mode stays on. Not
+   * while that row's own save is in flight: its images wait for the response (`saveEdit`).
+   */
+  private detectConflict(): void {
+    const snapshot = this.editing
+    if (!snapshot || snapshot.id === this.saving) return
+    const row = this.messages.get(snapshot.id)
+    if (row && usableRevision(row) && row.revision > snapshot.revision) { this.editing = row; this.error = conflictError() }
+  }
+  /** The 409 path: one `getMessage`; the row merges under the guards and becomes the new snapshot, `error`
+   * carries the conflict. A reload that answers `MESSAGE_NOT_FOUND` removes the row and leaves edit mode;
+   * another reload failure keeps the snapshot and surfaces that failure.
+   */
+  private async reloadConflict(id: string, conflict: unknown, generation: number): Promise<void> {
+    try {
+      const row = await this.options.client.getMessage(id)
+      if (!this.current(generation) || this.deleted.has(id)) return
+      if (row.id !== id || row.conversationId !== this.conversationId) throw new Error('Reloaded message does not match')
+      this.store(row)
+      if (this.editing?.id === id) this.editing = this.messages.get(id) ?? row
+      this.error = conflict
+    } catch (error) {
+      if (!this.current(generation) || this.deleted.has(id)) return
+      if (isTargetMiss(error)) this.remove(id)
+      this.error = error
+    }
+  }
+  /** Own, confirmed and not removed: the rows an author may edit or delete. */
+  private editable(row: Message): boolean {
+    return row.senderId === this.options.client.currentUserId && !isConvoKitPendingMessage(row) && !this.deleted.has(row.id)
+  }
+  /** The caller's role when the conversation reports it: the self-only `membership` (0.7 backend), else
+   * the caller's own `participants` entry.
+   */
+  private role(): string | undefined {
+    const me = this.options.client.currentUserId
+    return this.conversation?.membership?.role ??
+      this.conversation?.participants.find(row => row.appUserId === me || row.id === me)?.role
   }
   private remove(id: string): void {
     this.deleted.add(id); this.messages.delete(id)
+    if (this.editing?.id === id) this.editing = null
     // A removed acknowledgement target can never be confirmed; fall back to the next newest row once.
     const inFlight = this.inFlight?.id === id
     if (!inFlight && this.acknowledged?.id !== id) return
@@ -468,7 +655,7 @@ export class ConversationController extends ObservableStore<ConversationState> {
   private retire(generation: number): void {
     if (this.disposed || generation !== this.generation) return
     ++this.generation; this.messages.clear(); this.conversation = null; this.typing.clear(); this.reads.clear(); this.positions.clear()
-    this.resetAcknowledgements()
+    this.resetAcknowledgements(); this.editing = null; this.saving = null
     this.error = new Error('ConvoKit session ended'); this.emit()
   }
   private async clearSubscriptions(): Promise<void> {

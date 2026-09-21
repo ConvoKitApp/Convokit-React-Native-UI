@@ -57,7 +57,7 @@ const dm = conversation('dm', [me, ana])
 const group = conversation('group', [me, ana, bo])
 const activityAt = new Date('2026-08-01T11:19:00Z')
 const message = (senderId: string, text: string | null, media: MessageMedia[] = []): Message => ({
-  id: 'latest', conversationId: 'room', senderId, clientMessageId: null, text, media, createdAt: activityAt, updatedAt: null,
+  id: 'latest', conversationId: 'room', senderId, clientMessageId: null, text, media, createdAt: activityAt, updatedAt: null, revision: 0,
 })
 /** 0.7 summary literal: `isUnread` is derived from the count, the cap and the marker unless overridden. */
 const summary = (overrides: Partial<InboxSummary> = {}): InboxSummary => {

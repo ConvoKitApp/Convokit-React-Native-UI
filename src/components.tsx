@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState, type ReactElement, type ReactNode } from 'react'
 import {
-  ActivityIndicator, FlatList, Image, Pressable, StyleSheet, Text, TextInput, View,
+  ActivityIndicator, Alert, FlatList, Image, Pressable, StyleSheet, Text, TextInput, View, type AlertButton,
 } from 'react-native'
 import type { Conversation, InboxSummary, Message, MessageMedia, Participant, ReadPosition } from '@convokitapp/react-native'
+import { ComposerDraft } from './composer-draft'
 import { isConvoKitPendingMessage, resolveReaderIds } from './conversation-controller'
-import { conversationPreview, unreadBadge } from './inbox'
+import { useControllerState } from './hooks'
+import { conversationPreview, previewBody, unreadBadge } from './inbox'
 import { useConvoKitTheme } from './theme'
 
 type AsyncAction = () => void | Promise<void>
@@ -22,6 +24,19 @@ export interface ConversationRowContext {
 export interface MessageRowContext {
   message: Message; chronologicalIndex: number; isCurrentUser: boolean;
   sender?: Participant; readerIds: ReadonlySet<string>
+  /** 0.8: the content changed after the send (`revision > 0`); the default row shows `Edited`. */
+  isEdited: boolean
+  /** 0.8: whether the row may be edited / deleted here: the view was given the callback and the row is the
+   * caller's own, confirmed, and the caller's role is not `READ` (or `canEditMessage` said so).
+   */
+  canEdit: boolean
+  canDelete: boolean
+  /** 0.8: present only while `canEdit`: hand the row to `onEditMessage`. */
+  edit?: () => void
+  /** 0.8: present only while `canDelete`: confirm (the built-in dialog or `confirmDelete`) and hand the row
+   * to `onDeleteMessage`; resolves whether it was deleted.
+   */
+  remove?: () => Promise<boolean>
 }
 export interface MediaContext { media: MessageMedia; message: Message; isCurrentUser: boolean }
 
@@ -137,6 +152,25 @@ export interface MessageListViewProps {
   renderError?: (error: unknown, retry: AsyncAction) => ReactNode
   onAttachmentPress?: (message: Message, media: MessageMedia) => void
   reverse?: boolean; testID?: string
+  /** 0.8: enter edit mode on a row. Absent means no edit action anywhere (rows render as in 0.7). */
+  onEditMessage?: (message: Message) => void
+  /** 0.8: delete a confirmed row; `false` reports that nothing was deleted. Absent means no delete action. */
+  onDeleteMessage?: (message: Message) => boolean | void | Promise<boolean | void>
+  /** 0.8: replaces the built-in eligibility (own, role not `READ`) for both actions; pending rows are
+   * never eligible and the callbacks are still required.
+   */
+  canEditMessage?: (message: Message) => boolean
+  /** 0.8: replaces the built-in confirmation dialog; resolve `true` to delete. */
+  confirmDelete?: (message: Message) => boolean | Promise<boolean>
+}
+
+/** The built-in delete confirmation: an alert with `Delete` and `Cancel`; dismissing it declines. */
+function confirmDeletion(): Promise<boolean> {
+  return new Promise(resolve => Alert.alert(
+    'Delete this message?', 'It is removed for everyone and cannot be undone.',
+    [{ text: 'Cancel', style: 'cancel', onPress: () => resolve(false) }, { text: 'Delete', style: 'destructive', onPress: () => resolve(true) }],
+    { cancelable: true, onDismiss: () => resolve(false) },
+  ))
 }
 
 export function ConvoKitMessageListView(props: MessageListViewProps): ReactElement {
@@ -159,6 +193,14 @@ export function ConvoKitMessageListView(props: MessageListViewProps): ReactEleme
   const participants = new Map<string, Participant>()
   for (const participant of props.conversation.participants) {
     participants.set(participant.id, participant); participants.set(participant.appUserId, participant)
+  }
+  // The caller's role: the self-only `membership` (0.7 backend), else their own participants entry.
+  const role = props.conversation.membership?.role ?? participants.get(props.currentUserId)?.role
+  const eligible = (message: Message, mine: boolean): boolean =>
+    !isConvoKitPendingMessage(message) && (props.canEditMessage ? props.canEditMessage(message) : mine && role !== 'READ')
+  const remove = async (message: Message): Promise<boolean> => {
+    if (!await (props.confirmDelete ? props.confirmDelete(message) : confirmDeletion())) return false
+    return (await props.onDeleteMessage?.(message)) !== false
   }
   const readers = (message: Message): ReadonlySet<string> => {
     if (isConvoKitPendingMessage(message)) return new Set()
@@ -187,9 +229,14 @@ export function ConvoKitMessageListView(props: MessageListViewProps): ReactEleme
       const index = chronological.findIndex(row => row.id === item.id)
       const mine = item.senderId === props.currentUserId
       const readerIds = readers(item)
+      const canEdit = Boolean(props.onEditMessage) && eligible(item, mine)
+      const canDelete = Boolean(props.onDeleteMessage) && eligible(item, mine)
       const context: MessageRowContext = {
         message: item, chronologicalIndex: index, isCurrentUser: mine,
         ...(participants.get(item.senderId) ? { sender: participants.get(item.senderId)! } : {}), readerIds,
+        isEdited: item.revision > 0, canEdit, canDelete,
+        ...(canEdit ? { edit: () => props.onEditMessage?.(item) } : {}),
+        ...(canDelete ? { remove: () => remove(item) } : {}),
       }
       return <>{props.renderMessage?.(context) ?? <DefaultMessageRow
         {...context} renderMedia={props.renderMedia} renderReadReceipt={props.renderReadReceipt}
@@ -197,6 +244,17 @@ export function ConvoKitMessageListView(props: MessageListViewProps): ReactEleme
       />}</>
     }}
   />
+}
+
+/** What `renderComposer` receives. Since 0.8 `editing` and `cancelEdit` are present while the host is in
+ * edit mode: `send()` then saves the edit instead of sending, so custom composers need no branching.
+ */
+export interface ComposerContext {
+  value: string; setValue(value: string): void; send(): void; isSending: boolean; addAttachment?: () => void
+  /** The message being edited (the host's `editingMessage`). */
+  editing?: Message
+  /** Leave edit mode: restores the unsent draft and calls `onCancelEdit`. */
+  cancelEdit?: () => void
 }
 
 export interface ConversationViewProps extends Omit<MessageListViewProps, 'conversation' | 'messages' | 'currentUserId'> {
@@ -207,20 +265,51 @@ export interface ConversationViewProps extends Omit<MessageListViewProps, 'conve
   onTypingChanged?: (typing: boolean) => void
   onBack?: () => void; onRefresh?: AsyncAction; onAddAttachment?: () => void
   renderHeader?: (conversation: Conversation, actions: { onBack?: () => void; onRefresh?: AsyncAction }) => ReactNode
-  renderComposer?: (input: { value: string; setValue(value: string): void; send(): void; isSending: boolean; addAttachment?: () => void }) => ReactNode
+  renderComposer?: (input: ComposerContext) => ReactNode
   renderTypingIndicator?: (ids: ReadonlySet<string>, nameForUser: (id: string) => string) => ReactNode
   displayNameForUser?: (id: string) => string
+  /** 0.8: the host's edit session. While set the composer is in edit mode: the field is prefilled with the
+   * message text (stashing the unsent draft, no typing update), the banner shows the original, and the
+   * primary action saves through `onSaveEdit`. Null or absent is the 0.7 composer.
+   */
+  editingMessage?: Message | null
+  /** 0.8: save the edit with the trimmed field text (`''` clears the caption of a message with
+   * attachments). `false` keeps edit mode and the text, like `onSendMessage`; anything else restores the
+   * stashed draft. A text-only message is never saved empty (the action is disabled, nothing is called).
+   */
+  onSaveEdit?: (message: Message, text: string) => boolean | void | Promise<boolean | void>
+  /** 0.8: the user pressed Cancel; the view has already restored the stashed draft. */
+  onCancelEdit?: () => void
 }
 
 export function ConvoKitConversationView(props: ConversationViewProps): ReactElement {
-  const theme = useConvoKitTheme(); const [value, setValue] = useState(''); const submitting = useRef(false)
+  const theme = useConvoKitTheme(); const submitting = useRef(false)
+  const draftRef = useRef<ComposerDraft | null>(null)
+  if (!draftRef.current) draftRef.current = new ComposerDraft()
+  const draft = draftRef.current
+  draft.onTyping = props.onTypingChanged
+  const editing = props.editingMessage ?? null
+  draft.sync(editing)
+  const { value } = useControllerState(draft)
+  const setValue = (next: string) => draft.setValue(next)
   const typingUserIds = props.typingUserIds ?? new Set<string>()
+  // Save needs text, or attachments to keep when the caption is cleared; send needs text.
+  const canSubmit = editing ? Boolean(value.trim()) || editing.media.length > 0 : Boolean(value.trim())
   const send = async () => {
-    const text = value.trim(); if (!text || submitting.current || props.isSending) return
+    const text = value.trim(); if (!canSubmit || submitting.current || props.isSending) return
     submitting.current = true
-    try { if (await props.onSendMessage({ text })) { setValue(''); props.onTypingChanged?.(false) } }
-    finally { submitting.current = false }
+    try {
+      if (editing) {
+        if (!props.onSaveEdit) return
+        const token = draft.beginSave()
+        try { draft.completeSave(token, await props.onSaveEdit(editing, text) !== false) }
+        catch (error) { draft.completeSave(token, false); throw error }
+        return
+      }
+      if (await props.onSendMessage({ text })) { setValue(''); props.onTypingChanged?.(false) }
+    } finally { submitting.current = false }
   }
+  const cancelEdit = () => { draft.cancel(); props.onCancelEdit?.() }
   const names = (id: string) => props.displayNameForUser?.(id) ??
     props.conversation.participants.find(row => row.appUserId === id || row.id === id)?.name ?? id
   if (props.isInitialLoading && !props.messages.length) return <ActivityIndicator accessibilityLabel="Loading conversation" />
@@ -241,7 +330,20 @@ export function ConvoKitConversationView(props: ConversationViewProps): ReactEle
       (typingUserIds.size > 0 && <Text accessibilityLiveRegion="polite" style={{ paddingHorizontal: 16, color: theme.colors.mutedText }}>
         {[...typingUserIds].map(names).join(', ')} {typingUserIds.size === 1 ? 'is' : 'are'} typing…
       </Text>)}
-    {props.renderComposer?.({ value, setValue, send: () => void send(), isSending: Boolean(props.isSending), ...(props.onAddAttachment ? { addAttachment: props.onAddAttachment } : {}) }) ??
+    {props.renderComposer?.({
+      value, setValue, send: () => void send(), isSending: Boolean(props.isSending),
+      ...(props.onAddAttachment ? { addAttachment: props.onAddAttachment } : {}),
+      ...(editing ? { editing, cancelEdit } : {}),
+    }) ?? <>
+      {!!editing && <View accessibilityLiveRegion="polite" style={[styles.editBanner, { backgroundColor: theme.colors.surface, borderColor: theme.colors.border }]}>
+        <View style={styles.flex}>
+          <Text style={{ color: theme.colors.primary, fontWeight: '700', fontSize: theme.typography.caption }}>Editing message</Text>
+          <Text numberOfLines={1} style={{ color: theme.colors.mutedText }}>{editing.text ?? previewBody(editing)}</Text>
+        </View>
+        <Pressable accessibilityRole="button" accessibilityLabel="Cancel editing" hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} onPress={cancelEdit}>
+          <Text style={{ color: theme.colors.primary, fontWeight: '700' }}>Cancel</Text>
+        </Pressable>
+      </View>}
       <View style={[styles.composer, { backgroundColor: theme.colors.surface, borderColor: theme.colors.border }]}>
         {!!props.onAddAttachment && <Pressable accessibilityRole="button" accessibilityLabel="Add attachment" onPress={props.onAddAttachment}><Text style={{ color: theme.colors.primary, fontSize: 24 }}>＋</Text></Pressable>}
         <TextInput
@@ -254,21 +356,23 @@ export function ConvoKitConversationView(props: ConversationViewProps): ReactEle
         />
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel="Send message"
-          disabled={!value.trim() || props.isSending}
+          accessibilityLabel={editing ? 'Save message' : 'Send message'}
+          disabled={!canSubmit || props.isSending}
           hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
           onPress={() => void send()}
           style={styles.sendButton}
         >
-          <Text style={{ color: value.trim() ? theme.colors.primary : theme.colors.mutedText, fontWeight: '700' }}>Send</Text>
+          <Text style={{ color: canSubmit ? theme.colors.primary : theme.colors.mutedText, fontWeight: '700' }}>{editing ? 'Save' : 'Send'}</Text>
         </Pressable>
-      </View>}
+      </View>
+    </>}
   </View>
 }
 
 function DefaultMessageRow(props: MessageRowContext & Pick<MessageListViewProps, 'renderMedia' | 'renderReadReceipt' | 'onAttachmentPress'>): ReactElement {
   const theme = useConvoKitTheme(); const pending = isConvoKitPendingMessage(props.message)
-  return <View style={{ alignItems: props.isCurrentUser ? 'flex-end' : 'flex-start', marginBottom: theme.spacing.md }}>
+  const timeColor = props.isCurrentUser ? theme.colors.outgoingText : theme.colors.mutedText
+  const body = <>
     <View style={[styles.bubble, {
       backgroundColor: props.isCurrentUser ? theme.colors.outgoingBubble : theme.colors.incomingBubble,
       borderColor: theme.colors.border,
@@ -279,13 +383,37 @@ function DefaultMessageRow(props: MessageRowContext & Pick<MessageListViewProps,
         {props.renderMedia?.({ media, message: props.message, isCurrentUser: props.isCurrentUser }) ??
           <DefaultMedia media={media} onPress={() => props.onAttachmentPress?.(props.message, media)} />}
       </View>)}
-      <Text style={{ color: props.isCurrentUser ? theme.colors.outgoingText : theme.colors.mutedText, opacity: 0.75, fontSize: theme.typography.caption }}>
-        {pending ? 'Sending…' : formatMessageTime(props.message.createdAt)}
-      </Text>
+      {props.isEdited
+        ? <View style={styles.meta}>
+          <Text style={{ color: timeColor, opacity: 0.75, fontSize: theme.typography.caption }}>
+            {pending ? 'Sending…' : formatMessageTime(props.message.createdAt)}
+          </Text>
+          <Text accessibilityLabel="Edited" style={{ color: timeColor, opacity: 0.75, fontSize: theme.typography.caption }}>Edited</Text>
+        </View>
+        : <Text style={{ color: timeColor, opacity: 0.75, fontSize: theme.typography.caption }}>
+          {pending ? 'Sending…' : formatMessageTime(props.message.createdAt)}
+        </Text>}
     </View>
     {props.isCurrentUser && !pending && props.readerIds.size > 0 && <>{props.renderReadReceipt?.(props.message, props.readerIds) ??
       <Text style={{ color: theme.colors.mutedText, fontSize: theme.typography.caption }}>Read by {props.readerIds.size}</Text>}</>}
-  </View>
+  </>
+  const layout = { alignItems: props.isCurrentUser ? 'flex-end' as const : 'flex-start' as const, marginBottom: theme.spacing.md }
+  if (!props.edit && !props.remove) return <View style={layout}>{body}</View>
+  // An eligible row: a long press (or the `Message actions` accessibility action) opens the action sheet.
+  const showActions = () => {
+    const buttons: AlertButton[] = []
+    if (props.edit) buttons.push({ text: 'Edit message', onPress: props.edit })
+    if (props.remove) buttons.push({ text: 'Delete message', style: 'destructive', onPress: () => { void props.remove?.() } })
+    buttons.push({ text: 'Cancel', style: 'cancel' })
+    Alert.alert('Message actions', undefined, buttons, { cancelable: true })
+  }
+  return <Pressable
+    accessibilityActions={[{ name: 'messageActions', label: 'Message actions' }]}
+    onAccessibilityAction={event => { if (event.nativeEvent.actionName === 'messageActions') showActions() }}
+    accessibilityHint="Long press for message actions"
+    onLongPress={showActions}
+    style={layout}
+  >{body}</Pressable>
 }
 
 function DefaultMedia({ media, onPress }: { media: MessageMedia; onPress(): void }): ReactElement {
@@ -323,6 +451,8 @@ const styles = StyleSheet.create({
   header: { minHeight: 60, borderBottomWidth: StyleSheet.hairlineWidth, paddingHorizontal: 16, flexDirection: 'row', alignItems: 'center', gap: 12 },
   headerTitle: { flex: 1, fontSize: 17, fontWeight: '700' },
   composer: { borderTopWidth: StyleSheet.hairlineWidth, padding: 10, flexDirection: 'row', alignItems: 'flex-end', gap: 10 },
+  editBanner: { borderTopWidth: StyleSheet.hairlineWidth, paddingHorizontal: 16, paddingVertical: 8, flexDirection: 'row', alignItems: 'center', gap: 12 },
+  meta: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   sendButton: { minWidth: 72, minHeight: 48, paddingHorizontal: 12, paddingVertical: 12, alignItems: 'center', justifyContent: 'center' },
   input: { flex: 1, maxHeight: 120, minHeight: 42, borderWidth: StyleSheet.hairlineWidth, borderRadius: 18, paddingHorizontal: 12, paddingVertical: 9 },
   bubble: { maxWidth: 520, borderWidth: StyleSheet.hairlineWidth, borderRadius: 18, paddingHorizontal: 13, paddingVertical: 9, gap: 5 },

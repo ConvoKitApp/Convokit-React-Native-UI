@@ -17,7 +17,7 @@ export {
   ConvoKitMessageListView,
 } from './components'
 export type {
-  ConversationListViewProps, ConversationRowContext, ConversationViewProps, MediaContext,
+  ComposerContext, ConversationListViewProps, ConversationRowContext, ConversationViewProps, MediaContext,
   MessageListViewProps, MessageRowContext,
 } from './components'
 export { ConvoKitConversation, ConvoKitConversationList } from './bound-components'

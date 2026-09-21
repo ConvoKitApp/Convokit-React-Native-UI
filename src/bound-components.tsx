@@ -1,6 +1,6 @@
 import { useEffect, useRef, type ReactElement } from 'react'
 import { ActivityIndicator, Pressable, Text, View } from 'react-native'
-import type { ConvoKitClient, Conversation } from '@convokitapp/react-native'
+import type { ConvoKitClient, Conversation, Message } from '@convokitapp/react-native'
 import { DefaultConvoKitUiClient, type ConvoKitUiClient } from './client'
 import { ConversationController } from './conversation-controller'
 import { ConversationListController } from './conversation-list-controller'
@@ -55,7 +55,7 @@ export function ConvoKitConversationList(props: ConvoKitConversationListProps): 
 
 export interface ConvoKitConversationProps extends Omit<MessageListViewProps,
   'conversation' | 'messages' | 'currentUserId' | 'readAtByUserId' | 'readPositionByUserId' | 'onLoadOlder' |
-  'hasOlderMessages' | 'isLoadingOlder' | 'error'> {
+  'hasOlderMessages' | 'isLoadingOlder' | 'error' | 'onEditMessage' | 'onDeleteMessage'> {
   conversationId: string
   sdk?: ConvoKitClient
   client?: ConvoKitUiClient
@@ -107,6 +107,13 @@ export function ConvoKitConversation(props: ConvoKitConversationProps): ReactEle
     onRefresh={() => controller.refresh()}
     onSendMessage={async ({ text }) => Boolean(await controller.sendMessage({ text }))}
     onTypingChanged={typing => { void controller.updateTyping(typing) }}
+    editingMessage={state.editingMessage}
+    {...(state.canEditMessages ? {
+      onEditMessage: (message: Message) => controller.startEditing(message.id),
+      onSaveEdit: (_: Message, text: string) => controller.saveEdit(text),
+      onCancelEdit: () => controller.cancelEditing(),
+    } : {})}
+    {...(state.canDeleteMessages ? { onDeleteMessage: (message: Message) => controller.deleteMessage(message.id) } : {})}
   />
 }
 

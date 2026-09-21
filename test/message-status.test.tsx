@@ -40,7 +40,7 @@ const conversation: Conversation = {
 }
 const createdAt = new Date('2026-08-01T11:19:00Z')
 const message = (id: string, senderId: string, text: string): Message => ({
-  id, conversationId: 'room', senderId, clientMessageId: null, text, media: [], createdAt, updatedAt: null,
+  id, conversationId: 'room', senderId, clientMessageId: null, text, media: [], createdAt, updatedAt: null, revision: 0,
 })
 const render = (props: Partial<ComponentProps<typeof ConvoKitMessageListView>>) => renderToStaticMarkup(
   <ConvoKitMessageListView conversation={conversation} currentUserId="me" messages={[]} {...props} />,
