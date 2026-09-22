@@ -57,9 +57,12 @@ last acknowledged one. Acknowledgements are gated on visibility:
 `controller.setVisible`, a hidden app defers the request, and returning to the
 foreground re-issues only a deferred one. Apps that own a controller can reuse
 `useConvoKitVisibility(controller)`. If the server no longer knows the target
-(`MESSAGE_NOT_FOUND`), or the target is deleted while in flight, the controller
-retries once with the next newest rendered row; membership failures still
-surface as `error`.
+(`MESSAGE_NOT_FOUND`), or the in-flight or last acknowledged target is deleted,
+the controller retries once with the next newest rendered row. A deletion
+re-issues only where `markReadOnReceive` is enabled: a room that opted out of
+receive acknowledgements never sends one because a deletion arrived (an
+explicit `markRead()` still acknowledges the newest rendered row). Membership
+failures still surface as `error`.
 
 Custom `ConvoKitUiClient` adapters receive the target as
 `markConversationRead(id, { throughMessageId })`. Adapters that ignore it
@@ -102,8 +105,16 @@ edits, read-position advances). Activity is throttled by
 `activityRefreshWindowMs` (default `500`): the first signal starts the window,
 later signals ride along, and one refresh runs when it fires; `0` refreshes
 immediately. `inbox_changed`, a manual `refresh()` and a rejoin stay immediate
-and drop a pending activity timer. Room controllers keep subscribing to
-`onInboxChanged` only.
+and drop a pending activity timer. Room controllers subscribe to
+`onInboxChanged` only (never `onInboxActivity`) and reconcile the open room on
+every signal, exactly as on a rejoin, so a title or membership change, or a
+deletion whose `message_deleted` was missed, reaches the room without a
+foreground return. A signal that lands during the initial load, a reconcile
+or a history page queues one `refresh()` that runs afterwards (the SDK also
+delivers `inbox_changed` on every join, so an open room reconciles once right
+after loading), and a burst coalesces into that one refresh. The subscription
+is released with the room's other subscriptions on dispose and on the next
+`loadInitial()`.
 
 Default rows replace the participants/description line with a one-line preview
 when the summary has a latest message with a body: `You: hi` for the caller's
@@ -171,12 +182,18 @@ another user) is dropped. `clearUnread`
 resolves the response's `cleared`: whether this request removed the marker,
 not whether the room is read. A stale `ifVersion` or an unmarked room resolves
 `false` with the current state applied. A request failure sets `error`, keeps
-the row and resolves `false`; an adapter without the two members makes both
-methods reject. Other devices learn of a change through `onInboxActivity`,
-which the list already refetches from. There is no default row action: wire
-one through a custom `renderItem` (a long-press, a menu) that calls the
-controller returned by `useConvoKitConversationList`, or pass your own
-`controller` to `ConvoKitConversationList`. On the legacy path (custom
+the row and rejects (since 0.8.1; catch the promise), so only a `cleared:
+false` answer resolves `false`. An adapter without the two members makes both
+methods reject, and so does a controller that is not active: disposed, retired
+after the session ended, bound to a session the shared client has since
+replaced, or never loaded. Both reject with `ConversationListController is not
+active` before any request goes out, because a private marker must never be
+written under another user's login; `error` is untouched (there is no live
+snapshot to report into). Other devices learn of a change through
+`onInboxActivity`, which the list already refetches from. There is no default
+row action: wire one through a custom `renderItem` (a long-press, a menu) that
+calls the controller returned by `useConvoKitConversationList`, or pass your
+own `controller` to `ConvoKitConversationList`. On the legacy path (custom
 `pageLoader`, adapter without `listInbox`) the methods still call the adapter
 but there is no summary to patch.
 
@@ -252,6 +269,18 @@ resolves `true`; other failures keep the row, set `error` and resolve
 `false`. A remote `message_deleted` for the edited row, or a `refresh()` whose
 page no longer carries it, leaves edit mode.
 
+Deletion safety across a reconcile: `refresh()` (a rejoin, an `inbox_changed`
+signal, the foreground return) tombstones every confirmed row it knew when the
+reconcile was requested that the refetched range no longer carries, exactly as
+a `message_deleted` would, so a deletion missed while offline cannot be
+resurrected by a late edit or send response, a hydration or a row image, and
+the read acknowledgement re-targets as for any deletion. The reconciled window
+is the rendered rows up to the server's page cap of 100. A full page
+reconciles from its oldest row on: rows older than that window are dropped
+from view, never tombstoned, and `hasOlderMessages` turns true so the next
+`loadOlderMessages()` brings them back. Tombstones last until the next
+`loadInitial()`.
+
 Row precedence: when two rows for one id both carry a usable `revision` and
 they differ, the higher one wins and a lower one never overwrites, so a late
 edit response, or a `refresh()` page fetched before an edit, never rewinds a
@@ -276,13 +305,14 @@ without a typing update, a banner (a polite live region) reads
 `Cancel editing`), and the primary action reads `Save` with the accessible
 name `Save message` (`Send message` otherwise). Save is enabled while the
 trimmed field is non-empty or the edited message has attachments, so a caption
-can be cleared. Cancel and a successful save restore the stash and report
-typing for it; a failed save keeps the text and edit mode; when the host
-leaves edit mode externally (the row was removed) the field keeps user-changed
-text and restores the stash only when it is empty or unchanged. Custom
-composers receive the additive `editing` (the message) and `cancelEdit` on the
-`renderComposer` input (`ComposerContext`) while editing; `send()` saves then,
-so no branching is needed.
+can be cleared; author edits change text only, so the `Add attachment`
+control is hidden while editing. Cancel and a successful save restore the
+stash and report typing for it; a failed save keeps the text and edit mode;
+when the host leaves edit mode externally (the row was removed) the field
+keeps user-changed text and restores the stash only when it is empty or
+unchanged. Custom composers receive the additive `editing` (the message) and
+`cancelEdit` on the `renderComposer` input (`ComposerContext`) while editing;
+`send()` saves then, so no branching is needed.
 
 Controlled views. `ConvoKitMessageListView` accepts `onEditMessage(message)`,
 `onDeleteMessage(message)` (`false` reports that nothing was deleted),
@@ -290,8 +320,11 @@ Controlled views. `ConvoKitMessageListView` accepts `onEditMessage(message)`,
 `editingMessage`, `onSaveEdit(message, text)` (`false` keeps edit mode and the
 text, like `onSendMessage`) and `onCancelEdit`. Without the callbacks nothing
 new renders. Custom rows receive `isEdited`, `canEdit`, `canDelete` and, only
-while allowed, `edit()` and `remove()` (confirms, then calls
-`onDeleteMessage`; resolves whether it was deleted) on `MessageRowContext`.
+while allowed, `edit()` and `remove()` on `MessageRowContext`. `remove()` asks
+`confirmDelete` when the view was given one and otherwise calls
+`onDeleteMessage` at once (since 0.8.1; it resolves whether the row was
+deleted): confirmation UI is the custom row's own. Only the default row shows
+the built-in `Delete this message?` dialog when no `confirmDelete` is set.
 The bound `ConvoKitConversation` wires the controller (`editingMessage`,
 `startEditing`, `saveEdit`, `cancelEditing`, `deleteMessage`) only when the
 adapter supports the members and passes `confirmDelete` and `canEditMessage`
@@ -311,6 +344,135 @@ for members who already received them. Mixed fleet: a 0.7 view ignores
 actions but every save and delete fails with an uncoded 404 that keeps the
 row and the draft.
 
-Version 0.8.0 requires `@convokitapp/react-native` 0.8.x (peer
+## Controlled components
+
+Use `ConvoKitConversationListView`, `ConvoKitConversationView` and
+`ConvoKitMessageListView` when the application owns state.
+`useConvoKitConversationList` and `useConvoKitConversation` return the same
+controllers the bound components use, without forcing a state library. Pass
+`summaries` and `currentUserId` from the list state to
+`ConvoKitConversationListView` for previews and badges (both optional), and
+`readPositionByUserId` (plus `readAtByUserId` for users without a position)
+to the conversation views for receipts. `useConvoKitConversation` reports
+`AppState` itself; when you construct a `ConversationController` yourself,
+call `setVisible(false)` while the room is not on screen (or reuse
+`useConvoKitVisibility(controller)`) so acknowledgements wait until it is.
+Edit mode is a pure function of `editingMessage` plus the callbacks: pass the
+controller's `editingMessage`, `startEditing`, `saveEdit`, `cancelEditing` and
+`deleteMessage` (or your own state); leave them out and no action renders.
+
+```tsx
+import { Alert, Pressable, Text } from 'react-native'
+import {
+  ConvoKitConversationListView, ConvoKitConversationView, DefaultConvoKitUiClient, conversationPreview,
+  unreadBadge, useConvoKitConversation, useConvoKitConversationList,
+} from '@convokitapp/react-native-ui'
+
+const uiClient = new DefaultConvoKitUiClient(sdk)
+
+function Room({ roomId }: { roomId: string }) {
+  const { controller, state } = useConvoKitConversation({ client: uiClient, conversationId: roomId })
+  if (!state.conversation) return null
+  return <ConvoKitConversationView
+    conversation={state.conversation}
+    messages={state.messages}
+    currentUserId={state.currentUserId}
+    typingUserIds={state.typingUserIds}
+    readPositionByUserId={state.readPositionByUserId}
+    readAtByUserId={state.readAtByUserId}
+    isSending={state.isSending}
+    error={state.error}
+    onSendMessage={async ({ text }) => (await controller.sendMessage({ text })) !== null}
+    onTypingChanged={typing => void controller.updateTyping(typing)}
+    onLoadOlder={() => controller.loadOlderMessages()}
+    hasOlderMessages={state.hasOlderMessages}
+    editingMessage={state.editingMessage}
+    onEditMessage={message => controller.startEditing(message.id)}
+    onSaveEdit={(_message, text) => controller.saveEdit(text)}
+    onCancelEdit={() => controller.cancelEditing()}
+    onDeleteMessage={message => controller.deleteMessage(message.id)}
+    confirmDelete={message => new Promise<boolean>(resolve => Alert.alert(
+      'Delete this message?', message.text ?? undefined,
+      [{ text: 'Keep', style: 'cancel', onPress: () => resolve(false) }, { text: 'Delete', style: 'destructive', onPress: () => resolve(true) }],
+    ))}
+  />
+}
+
+function Inbox({ onOpen }: { onOpen(roomId: string): void }) {
+  const { controller, state } = useConvoKitConversationList({ client: uiClient, activityRefreshWindowMs: 500 })
+  return <ConvoKitConversationListView
+    conversations={state.conversations}
+    summaries={state.summaries}
+    currentUserId={state.currentUserId}
+    isInitialLoading={state.isInitialLoading}
+    isLoadingMore={state.isLoadingMore}
+    hasMore={state.hasMore}
+    error={state.error}
+    onRefresh={() => controller.refresh()}
+    onLoadMore={() => controller.loadMore()}
+    onConversationSelected={conversation => onOpen(conversation.id)}
+    renderItem={({ conversation, summary, currentUserId, onPress }) => {
+      const badge = summary ? unreadBadge(summary) : null
+      return <Pressable
+        onPress={onPress}
+        onLongPress={() => { void controller.markUnread(conversation.id).catch(error => Alert.alert(String(error))) }}
+        accessibilityLabel={badge ? `Open ${conversation.displayTitle}, ${badge.accessibilityLabel}` : `Open ${conversation.displayTitle}`}
+      >
+        <Text>{conversation.displayTitle}</Text>
+        {summary && <Text>{conversationPreview(conversation, summary, currentUserId) ?? conversation.description}</Text>}
+        {badge && <Text>{badge.dot ? 'Unread' : badge.label}</Text>}
+      </Pressable>
+    }}
+  />
+}
+```
+
+`markUnread` and `clearUnread` reject on a request failure and when the
+controller is not active, so keep the `catch`. A `ConversationListController`
+you construct yourself (`new ConversationListController({ client })`) drives
+the same view; dispose it when the screen unmounts.
+
+## Customization
+
+Every meaningful section can be replaced through render callbacks: the
+conversation row, separator, header, message, media block, read receipt,
+typing indicator, composer, and the loading, empty and error states.
+
+```tsx
+<ConvoKitConversationView
+  {...roomProps}
+  renderReadReceipt={(_message, readerIds) => <Text>{readerIds.size ? `Seen by ${readerIds.size}` : 'Sent'}</Text>}
+  renderMedia={({ media }) => media.type === 'location' ? <MyMap location={media} /> : undefined}
+  renderMessage={({ message, isCurrentUser, isEdited, edit, remove }) => (
+    <View style={{ alignItems: isCurrentUser ? 'flex-end' : 'flex-start' }}>
+      <Text>{message.text}</Text>
+      {isEdited && <Text accessibilityLabel="Edited">(edited)</Text>}
+      {edit && <Pressable accessibilityRole="button" onPress={edit}><Text>Edit</Text></Pressable>}
+      {remove && <Pressable accessibilityRole="button" onPress={() => void remove()}><Text>Delete</Text></Pressable>}
+    </View>
+  )}
+  renderComposer={({ value, setValue, send, isSending, editing, cancelEdit }) => (
+    <View>
+      {editing && <View>
+        <Text>Editing: {editing.text}</Text>
+        <Pressable accessibilityRole="button" accessibilityLabel="Cancel editing" onPress={cancelEdit}><Text>Cancel</Text></Pressable>
+      </View>}
+      <TextInput value={value} onChangeText={setValue} onSubmitEditing={send} />
+      <Pressable accessibilityRole="button" disabled={isSending} onPress={send}><Text>{editing ? 'Save' : 'Send'}</Text></Pressable>
+    </View>
+  )}
+/>
+```
+
+`send()` saves while `editing` is present and sends otherwise, so a custom
+composer needs no branching; `edit` and `remove` are present on a row exactly
+when that action is available to the viewer. A custom row's `remove()` asks
+`confirmDelete` when the view was given one and otherwise calls
+`onDeleteMessage` at once, so the row above owns its confirmation UI unless
+the host passes `confirmDelete`; the default row keeps the built-in dialog.
+`ConvoKitUiProvider` supplies the theme tokens (`colors.badge` included) that
+the default rows read through `useConvoKitTheme`.
+
+Version 0.8.1 requires `@convokitapp/react-native` 0.8.x (peer
 `>=0.8.0 <0.9.0`). Publish `@convokitapp/react-native` before publishing this
 package.

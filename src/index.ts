@@ -22,3 +22,9 @@ export type {
 } from './components'
 export { ConvoKitConversation, ConvoKitConversationList } from './bound-components'
 export type { ConvoKitConversationListProps, ConvoKitConversationProps } from './bound-components'
+// The core types the UI surface is typed against, so custom adapters and controller callers can import
+// them from this package alone (type-only: nothing is loaded from the peer at runtime).
+export type {
+  ClearConversationUnreadOptions, ClearUnreadResult, ConversationMembership, ConversationPrivateState, EditMessageInput,
+  InboxEntry, InboxSummary, Message, ReadPosition,
+} from '@convokitapp/react-native'

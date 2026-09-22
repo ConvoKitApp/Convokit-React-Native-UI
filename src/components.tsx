@@ -33,8 +33,9 @@ export interface MessageRowContext {
   canDelete: boolean
   /** 0.8: present only while `canEdit`: hand the row to `onEditMessage`. */
   edit?: () => void
-  /** 0.8: present only while `canDelete`: confirm (the built-in dialog or `confirmDelete`) and hand the row
-   * to `onDeleteMessage`; resolves whether it was deleted.
+  /** 0.8: present only while `canDelete`: ask `confirmDelete` when the view was given one, then hand the
+   * row to `onDeleteMessage`; resolves whether it was deleted. Custom rows own any other confirmation UI;
+   * only the default row shows the built-in `Alert` when no `confirmDelete` is set.
    */
   remove?: () => Promise<boolean>
 }
@@ -160,11 +161,13 @@ export interface MessageListViewProps {
    * never eligible and the callbacks are still required.
    */
   canEditMessage?: (message: Message) => boolean
-  /** 0.8: replaces the built-in confirmation dialog; resolve `true` to delete. */
+  /** 0.8: replaces the default row's built-in confirmation dialog and is the only confirmation a custom
+   * row's `remove()` asks for; resolve `true` to delete.
+   */
   confirmDelete?: (message: Message) => boolean | Promise<boolean>
 }
 
-/** The built-in delete confirmation: an alert with `Delete` and `Cancel`; dismissing it declines. */
+/** The default row's built-in delete confirmation: an alert with `Delete` and `Cancel`; dismissing it declines. */
 function confirmDeletion(): Promise<boolean> {
   return new Promise(resolve => Alert.alert(
     'Delete this message?', 'It is removed for everyone and cannot be undone.',
@@ -198,8 +201,10 @@ export function ConvoKitMessageListView(props: MessageListViewProps): ReactEleme
   const role = props.conversation.membership?.role ?? participants.get(props.currentUserId)?.role
   const eligible = (message: Message, mine: boolean): boolean =>
     !isConvoKitPendingMessage(message) && (props.canEditMessage ? props.canEditMessage(message) : mine && role !== 'READ')
+  // The `remove()` handed to rows asks `confirmDelete` only when the host provided one; confirmation UI is
+  // otherwise the row's own (the default row asks first through `inlineConfirm`).
   const remove = async (message: Message): Promise<boolean> => {
-    if (!await (props.confirmDelete ? props.confirmDelete(message) : confirmDeletion())) return false
+    if (props.confirmDelete && !await props.confirmDelete(message)) return false
     return (await props.onDeleteMessage?.(message)) !== false
   }
   const readers = (message: Message): ReadonlySet<string> => {
@@ -240,7 +245,7 @@ export function ConvoKitMessageListView(props: MessageListViewProps): ReactEleme
       }
       return <>{props.renderMessage?.(context) ?? <DefaultMessageRow
         {...context} renderMedia={props.renderMedia} renderReadReceipt={props.renderReadReceipt}
-        onAttachmentPress={props.onAttachmentPress}
+        onAttachmentPress={props.onAttachmentPress} inlineConfirm={!props.confirmDelete}
       />}</>
     }}
   />
@@ -345,7 +350,8 @@ export function ConvoKitConversationView(props: ConversationViewProps): ReactEle
         </Pressable>
       </View>}
       <View style={[styles.composer, { backgroundColor: theme.colors.surface, borderColor: theme.colors.border }]}>
-        {!!props.onAddAttachment && <Pressable accessibilityRole="button" accessibilityLabel="Add attachment" onPress={props.onAddAttachment}><Text style={{ color: theme.colors.primary, fontSize: 24 }}>＋</Text></Pressable>}
+        {/* Author edits change text only: no attachment control while editing. */}
+        {!!props.onAddAttachment && !editing && <Pressable accessibilityRole="button" accessibilityLabel="Add attachment" onPress={props.onAddAttachment}><Text style={{ color: theme.colors.primary, fontSize: 24 }}>＋</Text></Pressable>}
         <TextInput
           accessibilityLabel="Message" placeholder="Write a message" value={value} multiline
           onChangeText={next => {
@@ -369,7 +375,8 @@ export function ConvoKitConversationView(props: ConversationViewProps): ReactEle
   </View>
 }
 
-function DefaultMessageRow(props: MessageRowContext & Pick<MessageListViewProps, 'renderMedia' | 'renderReadReceipt' | 'onAttachmentPress'>): ReactElement {
+/** `inlineConfirm`: the view has no `confirmDelete`, so the row asks with the built-in dialog before `remove()`. */
+function DefaultMessageRow(props: MessageRowContext & Pick<MessageListViewProps, 'renderMedia' | 'renderReadReceipt' | 'onAttachmentPress'> & { inlineConfirm: boolean }): ReactElement {
   const theme = useConvoKitTheme(); const pending = isConvoKitPendingMessage(props.message)
   const timeColor = props.isCurrentUser ? theme.colors.outgoingText : theme.colors.mutedText
   const body = <>
@@ -400,10 +407,14 @@ function DefaultMessageRow(props: MessageRowContext & Pick<MessageListViewProps,
   const layout = { alignItems: props.isCurrentUser ? 'flex-end' as const : 'flex-start' as const, marginBottom: theme.spacing.md }
   if (!props.edit && !props.remove) return <View style={layout}>{body}</View>
   // An eligible row: a long press (or the `Message actions` accessibility action) opens the action sheet.
+  const remove = async () => {
+    if (props.inlineConfirm && !await confirmDeletion()) return
+    await props.remove?.()
+  }
   const showActions = () => {
     const buttons: AlertButton[] = []
     if (props.edit) buttons.push({ text: 'Edit message', onPress: props.edit })
-    if (props.remove) buttons.push({ text: 'Delete message', style: 'destructive', onPress: () => { void props.remove?.() } })
+    if (props.remove) buttons.push({ text: 'Delete message', style: 'destructive', onPress: () => { void remove() } })
     buttons.push({ text: 'Cancel', style: 'cancel' })
     Alert.alert('Message actions', undefined, buttons, { cancelable: true })
   }

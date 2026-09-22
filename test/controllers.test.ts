@@ -9,6 +9,7 @@ import { ConversationListController } from '../src/conversation-list-controller'
 import { filterConversations } from '../src/filter'
 import { mergeInboxEntries } from '../src/inbox'
 import type { ConvoKitUiClient } from '../src/client'
+import type { EditMessageInput, InboxSummary as ExportedInboxSummary } from '../src'
 
 // The React Native entry installs runtime polyfills, so the tests mock it with the shared
 // read-position helpers the package re-exports from the core SDK.
@@ -55,6 +56,7 @@ function client(rows: Message[] = [], participants: Participant[] = [], options:
     message?: (event: MessageEvent) => void
     deleted?: (event: MessageDeletedEvent) => void
     read?: (event: ReadEvent) => void
+    inboxChanged?: () => void
   } = {}
   const sdk: ConvoKitUiClient = {
     currentUserId: 'me', sessionIdentity: session,
@@ -95,7 +97,8 @@ function client(rows: Message[] = [], participants: Participant[] = [], options:
       }),
     }),
     sendTyping: vi.fn().mockResolvedValue(undefined),
-    onConnectionEvent: vi.fn(close), onInboxChanged: vi.fn(close),
+    onConnectionEvent: vi.fn(close),
+    onInboxChanged: vi.fn(handler => { handlers.inboxChanged = handler; return close() }),
     onMessage: vi.fn((_, handler) => { handlers.message = handler; return close() }),
     onMessageDeleted: vi.fn((_, handler) => { handlers.deleted = handler; return close() }),
     onReadReceipt: vi.fn((_, handler) => { handlers.read = handler; return close() }),
@@ -113,11 +116,23 @@ function client(rows: Message[] = [], participants: Participant[] = [], options:
     },
     async remove(id: string) { handlers.deleted!({ id, conversationId: 'room' }); await flush() },
     read(userId: string, readAt: Date, readPosition: ReadPosition | null = null) { handlers.read!({ userId, readAt, readPosition }) },
+    /** An `inbox_changed` signal for the bound user; the refresh it queues has settled once this resolves. */
+    async inboxChanged() { handlers.inboxChanged?.(); await flush() },
   }
   return { sdk, targets, acks, clears, live, rows, participants }
 }
 
 describe('UI state', () => {
+  it('re-exports the core types the UI surface is typed against', () => {
+    const input: EditMessageInput = { text: null, revision: 2 }
+    const inbox: ExportedInboxSummary = {
+      latestMessage: null, unreadCount: 0, unreadCountCapped: false, readPosition: null, lastReadAt: null,
+      unreadMarkedAt: null, privateStateVersion: 0, activityAt: at(0), isUnread: false,
+    }
+    expect(input.revision).toBe(2)
+    expect(inbox satisfies InboxSummary).toMatchObject({ isUnread: false })
+  })
+
   it('filters locally by text and participant', () => {
     const row = { ...conversation, participants: [participant('alex')] }
     expect(filterConversations([row], { query: 'support', participantIds: new Set(['alex']) })).toEqual([row])
@@ -428,6 +443,120 @@ describe('acknowledgements', () => {
     await controller.loadInitial()
     expect(targets()).toEqual(['m1'])
     expect(controller.getSnapshot().error).toBe(failure)
+    await controller.dispose()
+  })
+
+  // A deletion re-targets only where the next row's arrival would have been acknowledged anyway: a room
+  // that opted out of receive acknowledgements never sends one because a deletion arrived.
+  it('does not re-target an acknowledgement for a deletion when markReadOnReceive is off', async () => {
+    const { sdk, targets, live } = client([message('m1', 'alex', at(10)), message('m2', 'alex', at(20))])
+    const controller = new ConversationController({
+      conversationId: 'room', client: sdk, autoLoad: false, markReadOnLoad: true, markReadOnReceive: false,
+    })
+    await controller.loadInitial()
+    expect(targets()).toEqual(['m2'])
+    await live.insert(message('m4', 'alex', at(40)))
+    await live.remove('m2')
+    await flush()
+    expect(targets()).toEqual(['m2'])
+    expect(controller.getSnapshot().error).toBeNull()
+    // An explicit acknowledgement still resolves the newest rendered row.
+    await controller.markRead()
+    expect(targets()).toEqual(['m2', 'm4'])
+    // The in-flight target deleted under the same option: no follow-up either.
+    const pending = deferred()
+    vi.mocked(sdk.markConversationRead).mockReturnValueOnce(pending.promise)
+    await live.insert(message('m5', 'alex', at(50)))
+    const explicit = controller.markRead()
+    await flush()
+    expect(targets()).toEqual(['m2', 'm4', 'm5'])
+    await live.remove('m5')
+    pending.resolve()
+    await explicit
+    await flush()
+    expect(targets()).toEqual(['m2', 'm4', 'm5'])
+    expect(vi.mocked(sdk.markConversationRead)).toHaveBeenCalledTimes(3)
+    await controller.dispose()
+  })
+})
+
+describe('room reconciliation', () => {
+  it('reconciles the room on inbox_changed and drops the subscription on dispose', async () => {
+    const { sdk, live, rows } = client([message('m1', 'alex', at(10))])
+    const controller = new ConversationController({ conversationId: 'room', client: sdk, autoLoad: false, markReadOnLoad: false })
+    expect(sdk.onInboxChanged).not.toHaveBeenCalled()
+    await controller.loadInitial()
+    expect(sdk.onInboxChanged).toHaveBeenCalledTimes(1)
+    expect(sdk.getMessages).toHaveBeenCalledTimes(1)
+    rows.push(message('m2', 'alex', at(20)))
+    await live.inboxChanged()
+    expect(sdk.getMessages).toHaveBeenCalledTimes(2)
+    expect(sdk.getConversation).toHaveBeenCalledTimes(2)
+    expect(controller.getSnapshot().messages.map(row => row.id)).toEqual(['m1', 'm2'])
+    expect(controller.getSnapshot()).toMatchObject({ isReconciling: false, error: null })
+    // A burst during a reconcile is coalesced: one refresh in flight, one queued behind it.
+    const page = deferred<Message[]>()
+    vi.mocked(sdk.getMessages).mockReturnValueOnce(page.promise)
+    await live.inboxChanged(); await live.inboxChanged(); await live.inboxChanged()
+    expect(sdk.getMessages).toHaveBeenCalledTimes(3)
+    expect(controller.getSnapshot().isReconciling).toBe(true)
+    page.resolve([...rows].reverse())
+    await flush()
+    expect(sdk.getMessages).toHaveBeenCalledTimes(4)
+    expect(controller.getSnapshot()).toMatchObject({ isReconciling: false, error: null })
+    const subscription = vi.mocked(sdk.onInboxChanged).mock.results[0]!.value as RealtimeSubscription
+    expect(subscription.unsubscribe).not.toHaveBeenCalled()
+    await controller.dispose()
+    expect(subscription.unsubscribe).toHaveBeenCalledTimes(1)
+    await live.inboxChanged()
+    expect(sdk.getMessages).toHaveBeenCalledTimes(4)
+  })
+
+  // The SDK replays SUBSCRIBED (and so `inbox_changed`) synchronously to a listener joining an app hub the
+  // list already holds: the signal lands inside the load that binds it and must run once after it.
+  it('runs a signal delivered while binding as one refresh after the load, never a reload', async () => {
+    const { sdk, rows } = client([message('m1', 'alex', at(10))])
+    vi.mocked(sdk.onInboxChanged).mockImplementationOnce(handler => { handler(); return close() })
+    const controller = new ConversationController({ conversationId: 'room', client: sdk, autoLoad: false })
+    rows.push(message('m2', 'alex', at(20)))
+    await controller.loadInitial()
+    await flush()
+    expect(sdk.onInboxChanged).toHaveBeenCalledTimes(1)
+    expect(sdk.onMessage).toHaveBeenCalledTimes(1)
+    expect(sdk.getMessages).toHaveBeenCalledTimes(2)
+    expect(controller.getSnapshot()).toMatchObject({ hasLoaded: true, isInitialLoading: false, isReconciling: false, error: null })
+    expect(controller.getSnapshot().messages.map(row => row.id)).toEqual(['m1', 'm2'])
+    await controller.dispose()
+  })
+
+  it('still reconciles on the room rejoin, queued behind a reconcile in flight', async () => {
+    const { sdk, rows } = client([message('m1', 'alex', at(10))])
+    const controller = new ConversationController({ conversationId: 'room', client: sdk, autoLoad: false, markReadOnLoad: false })
+    await controller.loadInitial()
+    const connection = vi.mocked(sdk.onConnectionEvent).mock.calls[0]![0]
+    const page = deferred<Message[]>()
+    vi.mocked(sdk.getMessages).mockReturnValueOnce(page.promise)
+    connection({ topic: 'messages:room', status: 'SUBSCRIBED' })
+    connection({ topic: 'conversation:room', status: 'SUBSCRIBED' })
+    connection({ topic: 'messages:other', status: 'SUBSCRIBED' })
+    await flush()
+    expect(sdk.getMessages).toHaveBeenCalledTimes(2)
+    rows.push(message('m2', 'alex', at(20)))
+    page.resolve([message('m1', 'alex', at(10))])
+    await flush()
+    expect(sdk.getMessages).toHaveBeenCalledTimes(3)
+    expect(controller.getSnapshot().messages.map(row => row.id)).toEqual(['m1', 'm2'])
+    await controller.dispose()
+  })
+
+  it('re-subscribes to inbox_changed with the other room subscriptions on the next loadInitial', async () => {
+    const { sdk } = client([message('m1', 'alex', at(10))])
+    const controller = new ConversationController({ conversationId: 'room', client: sdk, autoLoad: false, markReadOnLoad: false })
+    await controller.loadInitial()
+    await controller.loadInitial()
+    expect(sdk.onInboxChanged).toHaveBeenCalledTimes(2)
+    const first = vi.mocked(sdk.onInboxChanged).mock.results[0]!.value as RealtimeSubscription
+    expect(first.unsubscribe).toHaveBeenCalledTimes(1)
     await controller.dispose()
   })
 })
@@ -918,6 +1047,120 @@ describe('message edits', () => {
     expect(controller.getSnapshot().editingMessage).toMatchObject({ id: 'm3', revision: 0 })
     expect(code(controller)).toBeUndefined()
     expect(sdk.editMessage).not.toHaveBeenCalled()
+    await controller.dispose()
+  })
+
+  // A row the reconciled range no longer carries was deleted while the client was away: it is tombstoned
+  // like a `message_deleted`, so nothing that answers late for it can bring it back.
+  it('tombstones a known row a refresh no longer carries so late answers cannot re-add it', async () => {
+    const mine = message('m2', 'me', at(20))
+    const { sdk, controller, live, rows, targets } = await open([message('m1', 'alex', at(10)), mine])
+    await controller.markRead()
+    expect(targets()).toEqual(['m2'])
+    controller.startEditing('m2')
+    const edit = deferred<Message>()
+    vi.mocked(sdk.editMessage!).mockReturnValueOnce(edit.promise)
+    const saving = controller.saveEdit('mine')
+    rows.splice(1, 1)
+    await controller.refresh()
+    expect(ids(controller)).toEqual(['m1'])
+    expect(controller.getSnapshot()).toMatchObject({ editingMessage: null, error: null, isReconciling: false })
+    // The removed acknowledgement target falls back to the next newest row, as for any deletion.
+    expect(targets()).toEqual(['m2', 'm1'])
+    // The late edit response, a row image, a hydration and a late deletion for the id are all dropped.
+    edit.resolve({ ...mine, text: 'mine', revision: 1 })
+    await saving
+    expect(ids(controller)).toEqual(['m1'])
+    await live.insert({ ...mine, text: 'mine', revision: 1 }, 'update')
+    await live.insert(mine, 'insert')
+    expect(ids(controller)).toEqual(['m1'])
+    expect(vi.mocked(sdk.getMessage).mock.calls.map(([id]) => id)).not.toContain('m2')
+    await live.remove('m2')
+    expect(ids(controller)).toEqual(['m1'])
+    expect(targets()).toEqual(['m2', 'm1'])
+    expect(controller.getSnapshot().error).toBeNull()
+    // The next loadInitial starts over: the id is a live row again.
+    await controller.loadInitial()
+    expect(ids(controller)).toEqual(['m1', 'm2'])
+    await controller.dispose()
+  })
+
+  it('never tombstones a row older than the reconciled range', async () => {
+    const [m1, m2] = [message('m1', 'alex', at(10)), message('m2', 'alex', at(20))]
+    const fixture = client([m1, m2])
+    // A page honours `limit` (newest first), like the server.
+    vi.mocked(fixture.sdk.getMessages).mockImplementation(async ({ limit }) => [...fixture.rows].reverse().slice(0, limit))
+    const controller = new ConversationController({ conversationId: 'room', client: fixture.sdk, autoLoad: false, markReadOnLoad: false, messagePageSize: 2 })
+    await controller.loadInitial()
+    expect(ids(controller)).toEqual(['m1', 'm2'])
+    // Two rows arrived while away: the refetched page ends at m3, so m1 and m2 are outside the window.
+    fixture.rows.push(message('m3', 'alex', at(30)), message('m4', 'alex', at(40)))
+    await controller.refresh()
+    expect(ids(controller)).toEqual(['m3', 'm4'])
+    expect(controller.getSnapshot().error).toBeNull()
+    await fixture.live.insert({ ...m1, text: 'still here', revision: 1 }, 'update')
+    expect(ids(controller)).toEqual(['m1', 'm3', 'm4'])
+    expect(row(controller, 'm1')?.text).toBe('still here')
+    // A row inside the window that the page no longer carries is gone for good (the window now spans the
+    // three rendered rows, so m2 is back in it and m3, deleted meanwhile, is tombstoned).
+    fixture.rows.splice(fixture.rows.findIndex(candidate => candidate.id === 'm3'), 1)
+    await controller.refresh()
+    expect(ids(controller)).toEqual(['m1', 'm2', 'm4'])
+    await fixture.live.insert(message('m3', 'alex', at(30)), 'update')
+    expect(ids(controller)).toEqual(['m1', 'm2', 'm4'])
+    await controller.dispose()
+  })
+
+  /** `getMessages` as the backend serves it: newest first, honouring the cursor, `limit` clamped to 100. */
+  const server = (rows: Message[]) => async ({ limit, beforeCreatedAt, beforeId }: Parameters<ConvoKitUiClient['getMessages']>[0]) => {
+    const before = beforeCreatedAt && beforeId ? { id: beforeId, createdAt: beforeCreatedAt } : null
+    return [...rows].reverse()
+      .filter(candidate => !before || candidate.createdAt < before.createdAt || (candidate.createdAt.getTime() === before.createdAt.getTime() && candidate.id < before.id))
+      .slice(0, Math.min(Math.max(limit, 1), 100))
+  }
+  const history = (count: number) => Array.from({ length: count }, (_, index) => message(`m${String(index + 1).padStart(3, '0')}`, 'alex', at(index + 1)))
+
+  it('reconciles at most the server page cap: rows beyond it are neither tombstoned nor lost', async () => {
+    const fixture = client(history(130))
+    vi.mocked(fixture.sdk.getMessages).mockImplementation(server(fixture.rows))
+    const controller = new ConversationController({ conversationId: 'room', client: fixture.sdk, autoLoad: false, markReadOnLoad: false, messagePageSize: 30 })
+    await controller.loadInitial()
+    for (let page = 0; page < 3; page++) await controller.loadOlderMessages()
+    expect(ids(controller)).toHaveLength(120)
+    // m100 was deleted meanwhile (inside the window); the capped page then spans m030..m130, so m011..m029
+    // only fall outside the 100-row window.
+    fixture.rows.splice(fixture.rows.findIndex(candidate => candidate.id === 'm100'), 1)
+    await controller.refresh()
+    expect(vi.mocked(fixture.sdk.getMessages).mock.calls.at(-1)![0]).toMatchObject({ limit: 100, offset: 0 })
+    expect(controller.getSnapshot()).toMatchObject({ error: null, hasOlderMessages: true })
+    expect(ids(controller)).toHaveLength(100)
+    expect(ids(controller)[0]).toBe('m030')
+    await fixture.live.insert(message('m100', 'alex', at(100)), 'update')
+    expect(row(controller, 'm100')).toBeUndefined()
+    // The next history page brings the rows outside the window back; the deletion stays.
+    await controller.loadOlderMessages()
+    expect(ids(controller)).toHaveLength(129)
+    expect(ids(controller).slice(0, 3)).toEqual(['m001', 'm002', 'm003'])
+    expect(ids(controller)).toContain('m029')
+    expect(ids(controller)).not.toContain('m100')
+    await controller.dispose()
+  })
+
+  it('reopens an exhausted history when the reconciled window drops rows from view', async () => {
+    const fixture = client(history(110))
+    vi.mocked(fixture.sdk.getMessages).mockImplementation(server(fixture.rows))
+    const controller = new ConversationController({ conversationId: 'room', client: fixture.sdk, autoLoad: false, markReadOnLoad: false, messagePageSize: 30 })
+    await controller.loadInitial()
+    for (let page = 0; page < 3; page++) await controller.loadOlderMessages()
+    expect(ids(controller)).toHaveLength(110)
+    expect(controller.getSnapshot().hasOlderMessages).toBe(false)
+    await controller.refresh()
+    expect(ids(controller)).toHaveLength(100)
+    expect(controller.getSnapshot().hasOlderMessages).toBe(true)
+    await controller.loadOlderMessages()
+    expect(ids(controller)).toHaveLength(110)
+    expect(ids(controller)[0]).toBe('m001')
+    expect(controller.getSnapshot().hasOlderMessages).toBe(false)
     await controller.dispose()
   })
 
@@ -1561,19 +1804,24 @@ describe('ConversationListController', () => {
       await controller.dispose()
     })
 
-    it('surfaces a failed mark or clear through error without evicting rows', async () => {
+    it('rejects a failed mark or clear and surfaces it through error without evicting rows', async () => {
       const { sdk, inbox } = listClient()
       inbox(() => page([entry('a', 50)]))
       const controller = list(sdk)
       await controller.loadInitial()
       vi.mocked(sdk.markConversationUnread!).mockRejectedValueOnce(status(404))
-      await controller.markUnread('a')
+      await expect(controller.markUnread('a')).rejects.toEqual(status(404))
       expect(controller.getSnapshot().error).toEqual(status(404))
       expect(ids(controller)).toEqual(['a'])
       vi.mocked(sdk.clearConversationUnread!).mockRejectedValueOnce(status(500))
-      await expect(controller.clearUnread('a')).resolves.toBe(false)
+      await expect(controller.clearUnread('a')).rejects.toEqual(status(500))
       expect(controller.getSnapshot().error).toEqual(status(500))
       expect(summaryOf(controller, 'a')).toMatchObject({ isUnread: false, privateStateVersion: 0 })
+      // Only a `cleared: false` answer resolves `false`: the request succeeded and the marker moved on.
+      vi.mocked(sdk.clearConversationUnread!).mockResolvedValueOnce({ conversationId: 'a', cleared: false, unreadMarkedAt: null, privateStateVersion: 1 })
+      await expect(controller.clearUnread('a', { ifVersion: 0 })).resolves.toBe(false)
+      expect(controller.getSnapshot().error).toEqual(status(500))
+      expect(summaryOf(controller, 'a')).toMatchObject({ isUnread: false, privateStateVersion: 1 })
       await controller.dispose()
     })
 
@@ -1598,10 +1846,70 @@ describe('ConversationListController', () => {
       heldMark.resolve({ conversationId: 'a', unreadMarkedAt: at(60), privateStateVersion: 6 })
       heldClear.reject(status(500))
       await marking
-      await expect(clearing).resolves.toBe(false)
+      // The failure still rejects the caller, but the next user's snapshot never learns of it.
+      await expect(clearing).rejects.toEqual(status(500))
       expect(summaryOf(controller, 'a')).toMatchObject({ isUnread: false, unreadMarkedAt: null, privateStateVersion: 0 })
       expect(controller.getSnapshot().error).toBeNull()
       expect(listener).not.toHaveBeenCalled()
+      await controller.dispose()
+    })
+
+    it('refuses to send once disposed, after the session ended or under a replacement login', async () => {
+      const { sdk, signals, inbox } = listClient()
+      inbox(() => page([entry('a', 50)]))
+      const refused = async (controller: ConversationListController) => {
+        await expect(controller.markUnread('a')).rejects.toThrow('ConversationListController is not active')
+        await expect(controller.clearUnread('a', { ifVersion: 1 })).rejects.toThrow('ConversationListController is not active')
+        expect(sdk.markConversationUnread).not.toHaveBeenCalled()
+        expect(sdk.clearConversationUnread).not.toHaveBeenCalled()
+      }
+      // After the session ended: the rows are gone and nothing goes out.
+      const ended = list(sdk)
+      await ended.loadInitial()
+      signals.ended!()
+      await refused(ended)
+      expect(ended.getSnapshot().error).toEqual(new Error('ConvoKit session ended'))
+      // Under a replacement login on the shared client (no reload yet): a private marker must never be
+      // written under another user. The next loadInitial binds the new session and sends again.
+      Object.assign(sdk, { sessionIdentity: {} })
+      await refused(ended)
+      await ended.loadInitial()
+      await ended.markUnread('a')
+      expect(sdk.markConversationUnread).toHaveBeenCalledTimes(1)
+      expect(ended.getSnapshot().error).toBeNull()
+      vi.mocked(sdk.markConversationUnread!).mockClear()
+      // After dispose: the same refusal, and `error` is untouched (there is no live snapshot).
+      const disposed = list(sdk)
+      await disposed.loadInitial()
+      await disposed.dispose()
+      await refused(disposed)
+      expect(disposed.getSnapshot().error).toBeNull()
+      // A store that never loaded has no session to send under.
+      await refused(list(sdk))
+      await ended.dispose()
+    })
+
+    it('refuses to send under a replacement login on the legacy path too, where reads skip the session', async () => {
+      const { sdk } = listClient({ inbox: false })
+      const pageLoader = vi.fn(async () => [room('legacy')])
+      const controller = list(sdk, { pageLoader })
+      await controller.loadInitial()
+      await controller.markUnread('legacy')
+      expect(sdk.markConversationUnread).toHaveBeenCalledTimes(1)
+      // The shared client now belongs to another user; the connection event that retires the store has not
+      // arrived yet. Reads still run through the page loader, but no marker goes out under the new login.
+      Object.assign(sdk, { sessionIdentity: {} })
+      await controller.refresh()
+      expect(pageLoader).toHaveBeenCalledTimes(2)
+      await expect(controller.markUnread('legacy')).rejects.toThrow('ConversationListController is not active')
+      await expect(controller.clearUnread('legacy')).rejects.toThrow('ConversationListController is not active')
+      expect(sdk.markConversationUnread).toHaveBeenCalledTimes(1)
+      expect(sdk.clearConversationUnread).not.toHaveBeenCalled()
+      expect(controller.getSnapshot().error).toBeNull()
+      // The next loadInitial binds the new session and sends again.
+      await controller.loadInitial()
+      await controller.markUnread('legacy')
+      expect(sdk.markConversationUnread).toHaveBeenCalledTimes(2)
       await controller.dispose()
     })
 

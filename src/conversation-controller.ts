@@ -14,6 +14,11 @@ import { closeAll, ObservableStore } from './store'
 
 const pendingPrefix = 'convokit-pending-'
 export const isConvoKitPendingMessage = (message: Message): boolean => message.id.startsWith(pendingPrefix)
+/** The most rows one `getMessages` page carries: the backend clamps a larger `limit` to 100 silently (the SDK
+ * forwards it unchecked), so a page of exactly this many rows is a full page, never proof that nothing older
+ * exists.
+ */
+const maxMessageLimit = 100
 
 export interface ConversationState {
   conversation: Conversation | null
@@ -134,6 +139,7 @@ export class ConversationController extends ObservableStore<ConversationState> {
   private loadingOlder = false
   private sending = false
   private reconciling = false
+  private refreshQueued = false
   private hasOlder = true
   private hasLoaded = false
   private error: unknown = null
@@ -205,7 +211,7 @@ export class ConversationController extends ObservableStore<ConversationState> {
     const generation = ++this.generation
     await this.clearSubscriptions()
     this.messages.clear(); this.deleted.clear(); this.typing.clear(); this.reads.clear(); this.positions.clear()
-    this.resetAcknowledgements(); this.editing = null; this.saving = null
+    this.resetAcknowledgements(); this.editing = null; this.saving = null; this.refreshQueued = false
     this.conversation = null; this.error = null; this.hasOlder = true; this.initialLoading = true; this.emit()
     this.sessionIdentity = this.options.client.sessionIdentity
     try {
@@ -225,7 +231,7 @@ export class ConversationController extends ObservableStore<ConversationState> {
       if (this.options.markReadOnLoad !== false) await this.acknowledge()
     } catch (error) { if (this.current(generation)) this.error = error }
     finally {
-      if (this.current(generation)) { this.initialLoading = false; this.hasLoaded = true; this.emit() }
+      if (this.current(generation)) { this.initialLoading = false; this.hasLoaded = true; this.emit(); this.flushRefresh() }
     }
   }
 
@@ -233,10 +239,16 @@ export class ConversationController extends ObservableStore<ConversationState> {
     if (!this.hasLoaded) return this.loadInitial()
     if (this.reconciling || this.disposed) return
     const generation = this.generation; this.reconciling = true; this.emit()
+    // The reconciled window: every rendered row, up to the server's page cap (asking for more than the cap
+    // would be clamped silently, and a short page then could not tell a deletion from the clamp). The
+    // confirmed rows known when the reconcile was requested; a row that arrives during the fetch is not one
+    // of them, so it can never be tombstoned by a page fetched before it existed.
+    const limit = Math.min(Math.max(this.messages.size, this.messagePageSize), maxMessageLimit)
+    const known = [...this.messages.values()].filter(row => !isConvoKitPendingMessage(row))
     try {
       const [conversation, page] = await Promise.all([
         this.options.client.getConversation(this.conversationId),
-        this.options.client.getMessages({ conversationId: this.conversationId, limit: Math.max(this.messages.size, this.messagePageSize), offset: 0 }),
+        this.options.client.getMessages({ conversationId: this.conversationId, limit, offset: 0 }),
       ])
       if (!this.current(generation)) return
       this.assertRows(page)
@@ -258,11 +270,24 @@ export class ConversationController extends ObservableStore<ConversationState> {
       this.messages = canonical
       // A row the page no longer carries is no longer rendered: its edit session ends with it.
       if (this.editing && !canonical.has(this.editing.id)) this.editing = null
+      // A known row missing from the reconciled range was deleted while the client was away (a missed
+      // `message_deleted`): tombstone it so a late edit or send response, a hydration or a row image cannot
+      // re-add it. A full page only reconciles from its oldest row on; rows older than that are outside
+      // the window (not refetched, not deleted) and are never tombstoned: they left the view, and the next
+      // history page brings them back, so the history is open again even if it had been exhausted.
+      const boundary = page.length < limit ? null : page.reduce<MessageCursor | null>(
+        (oldest, row) => (!oldest || compareCursor(row, oldest) < 0 ? row : oldest), null,
+      )
+      for (const row of known) {
+        if (canonical.has(row.id) || this.deleted.has(row.id)) continue
+        if (boundary && compareCursor(row, boundary) < 0) { this.hasOlder = true; continue }
+        this.remove(row.id)
+      }
       this.mergeParticipantReads(conversation)
       this.error = null
       this.detectConflict()
     } catch (error) { if (this.current(generation)) this.error = error }
-    finally { if (this.current(generation)) { this.reconciling = false; this.emit() } }
+    finally { if (this.current(generation)) { this.reconciling = false; this.emit(); this.flushRefresh() } }
   }
 
   async loadOlderMessages(): Promise<void> {
@@ -278,7 +303,7 @@ export class ConversationController extends ObservableStore<ConversationState> {
       if (!this.current(generation)) return
       this.assertRows(page); this.merge(page); this.hasOlder = page.length === this.messagePageSize
     } catch (error) { if (this.current(generation)) this.error = error }
-    finally { if (this.current(generation)) { this.loadingOlder = false; this.emit() } }
+    finally { if (this.current(generation)) { this.loadingOlder = false; this.emit(); this.flushRefresh() } }
   }
 
   async sendMessage(input: { text?: string; media?: MessageMedia[] }): Promise<Message | null> {
@@ -468,9 +493,28 @@ export class ConversationController extends ObservableStore<ConversationState> {
       if (!this.current(generation)) return
       if (event.status === 'SUBSCRIBED' &&
           (event.topic === `messages:${this.conversationId}` || event.topic === `conversation:${this.conversationId}`)) {
-        void this.refresh()
+        this.queueRefresh()
       }
     }, () => this.retire(generation)))
+    // `inbox_changed` (a title or membership change, a deletion whose `message_deleted` was missed) reconciles
+    // the room like a rejoin does. The SDK also delivers it on every join, synchronously when the app hub is
+    // already subscribed, so the signal is queued behind the load that is binding it.
+    this.subscriptions.add(client.onInboxChanged(() => {
+      if (!this.current(generation)) return
+      this.queueRefresh()
+    }))
+  }
+  /** Reconcile once the current load, reconcile or history page settles; one queued refresh covers every
+   * signal received meanwhile (a rejoin, an `inbox_changed` burst).
+   */
+  private queueRefresh(): void {
+    this.refreshQueued = true
+    this.flushRefresh()
+  }
+  private flushRefresh(): void {
+    if (!this.refreshQueued || this.disposed || !this.hasLoaded || this.initialLoading || this.loadingOlder || this.reconciling) return
+    this.refreshQueued = false
+    void this.refresh()
   }
   private async receive(row: Message, type: MessageEvent['type'], generation: number): Promise<void> {
     if (!this.current(generation) || row.conversationId !== this.conversationId || this.deleted.has(row.id)) return
@@ -551,11 +595,14 @@ export class ConversationController extends ObservableStore<ConversationState> {
   private remove(id: string): void {
     this.deleted.add(id); this.messages.delete(id)
     if (this.editing?.id === id) this.editing = null
-    // A removed acknowledgement target can never be confirmed; fall back to the next newest row once.
+    // A removed acknowledgement target can never be confirmed; fall back to the next newest row once, but
+    // only where that row's arrival would have been acknowledged anyway: a room that opted out of receive
+    // acknowledgements never sends one because a deletion arrived (an explicit `markRead()` still does).
     const inFlight = this.inFlight?.id === id
     if (!inFlight && this.acknowledged?.id !== id) return
     this.unacknowledgeable.add(id)
     if (!inFlight) this.acknowledged = null
+    if (this.options.markReadOnReceive === false) return
     if (this.acknowledging) this.followUp = true
     else void this.acknowledge()
   }
@@ -655,7 +702,7 @@ export class ConversationController extends ObservableStore<ConversationState> {
   private retire(generation: number): void {
     if (this.disposed || generation !== this.generation) return
     ++this.generation; this.messages.clear(); this.conversation = null; this.typing.clear(); this.reads.clear(); this.positions.clear()
-    this.resetAcknowledgements(); this.editing = null; this.saving = null
+    this.resetAcknowledgements(); this.editing = null; this.saving = null; this.refreshQueued = false
     this.error = new Error('ConvoKit session ended'); this.emit()
   }
   private async clearSubscriptions(): Promise<void> {

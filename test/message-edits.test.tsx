@@ -173,6 +173,21 @@ describe('default row actions', () => {
     expect(handlers.onDeleteMessage).toHaveBeenCalledTimes(1)
   })
 
+  it('asks a provided confirmDelete from a custom row\'s remove() and nothing else', async () => {
+    const handlers = callbacks()
+    const confirmDelete = vi.fn(async () => false)
+    const seen: RowContext[] = []
+    list({ messages: [mine], ...handlers, confirmDelete, renderMessage: context => { seen.push(context); return null } })
+    await expect(seen[0]!.remove!()).resolves.toBe(false)
+    expect(confirmDelete).toHaveBeenCalledWith(mine)
+    expect(handlers.onDeleteMessage).not.toHaveBeenCalled()
+    expect(alerts()).toHaveLength(0)
+    confirmDelete.mockResolvedValueOnce(true)
+    await expect(seen[0]!.remove!()).resolves.toBe(true)
+    expect(handlers.onDeleteMessage).toHaveBeenCalledWith(mine)
+    expect(alerts()).toHaveLength(0)
+  })
+
   it('lets confirmDelete replace the built-in dialog', async () => {
     const handlers = callbacks()
     const confirmDelete = vi.fn(async (message: Message) => message.id !== 'm1')
@@ -200,14 +215,14 @@ describe('default row actions', () => {
     ])
     seen[0]!.edit!()
     expect(handlers.onEditMessage).toHaveBeenCalledWith(mine)
-    const removing = seen[0]!.remove!()
-    press(0, 'Delete')
-    await expect(removing).resolves.toBe(true)
+    // Without `confirmDelete` a custom row's `remove()` calls `onDeleteMessage` at once: the built-in
+    // dialog belongs to the default row, confirmation UI to the custom row.
+    await expect(seen[0]!.remove!()).resolves.toBe(true)
+    expect(alerts()).toHaveLength(0)
     expect(handlers.onDeleteMessage).toHaveBeenCalledWith(mine)
     handlers.onDeleteMessage.mockReturnValueOnce(false)
-    const refused = seen[0]!.remove!()
-    press(1, 'Delete')
-    await expect(refused).resolves.toBe(false)
+    await expect(seen[0]!.remove!()).resolves.toBe(false)
+    expect(alerts()).toHaveLength(0)
     // The override replaces own/role, never the pending or callback rules.
     const overridden: RowContext[] = []
     list({
@@ -249,6 +264,19 @@ describe('composer edit mode', () => {
     expect(inputs[1]?.value).toBe('')
     expect(text(media)).toContain('Editing message')
     expect(text(media)).toContain('Photo')
+  })
+
+  it('hides Add attachment while editing: author edits change text only', () => {
+    const onAddAttachment = vi.fn()
+    const idle = view({ messages: [mine], onAddAttachment })
+    expect(idle).toContain('aria-label="Add attachment"')
+    const editing = view({ messages: [mine], editingMessage: mine, onSaveEdit: vi.fn(), onCancelEdit: vi.fn(), onAddAttachment })
+    expect(editing).not.toContain('aria-label="Add attachment"')
+    expect(editing).toContain('aria-label="Save message"')
+    expect(pressed.some(props => props.accessibilityLabel === 'Add attachment')).toBe(true)
+    expect(pressed.filter(props => props.accessibilityLabel === 'Add attachment')).toHaveLength(1)
+    // Leaving edit mode brings it back.
+    expect(view({ messages: [mine], editingMessage: null, onAddAttachment })).toContain('aria-label="Add attachment"')
   })
 
   it('saves through onSaveEdit with the trimmed text instead of sending', async () => {

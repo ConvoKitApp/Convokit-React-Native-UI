@@ -160,34 +160,35 @@ export class ConversationListController extends ObservableStore<ConversationList
   setQuery(query: string): Promise<void> { return this.setFilter({ ...this.filter, query }) }
 
   /** Flag a room unread for the caller only (`markConversationUnread`). The response is applied to the
-   * room's summary unless a newer private state is already stored; a request failure sets `error` and
-   * keeps the row. Both apply only while this load of the store is still current (not disposed, retired
-   * or reloaded for another session). Rejects when the adapter lacks the 0.7 member. Other devices learn
-   * of the marker through `inbox_activity`.
+   * room's summary unless a newer private state is already stored; a request failure sets `error`, keeps
+   * the row and rejects. Both apply only while this load of the store is still current (not disposed,
+   * retired or reloaded for another session). Rejects when the adapter lacks the 0.7 member, and, before
+   * any request, when the controller is not active (see `assertActive`). Other devices learn of the marker
+   * through `inbox_activity`.
    */
   async markUnread(conversationId: string): Promise<void> {
     const mark = this.options.client.markConversationUnread
     if (!mark) throw new Error('The ConvoKitUiClient adapter does not implement markConversationUnread')
+    this.assertActive()
     const generation = this.generation
-    try {
-      this.applyPrivateState(conversationId, await mark.call(this.options.client, conversationId), generation)
-    } catch (error) { this.reportPrivateStateError(error, generation) }
+    const state = await this.mutatePrivateState(() => mark.call(this.options.client, conversationId), generation)
+    this.applyPrivateState(conversationId, state, generation)
   }
 
   /** Remove the caller's marker (`clearConversationUnread`), conditionally on `options.ifVersion`. Resolves
    * the response's `cleared`: whether this request removed the marker, not whether the room is read. The
    * response is applied to the summary either way; a request failure sets `error`, keeps the row and
-   * resolves `false`. Rejects when the adapter lacks the 0.7 member.
+   * rejects. Rejects when the adapter lacks the 0.7 member, and, before any request, when the controller is
+   * not active (see `assertActive`).
    */
   async clearUnread(conversationId: string, options?: ClearConversationUnreadOptions): Promise<boolean> {
     const clear = this.options.client.clearConversationUnread
     if (!clear) throw new Error('The ConvoKitUiClient adapter does not implement clearConversationUnread')
+    this.assertActive()
     const generation = this.generation
-    try {
-      const result = await clear.call(this.options.client, conversationId, options ?? {})
-      this.applyPrivateState(conversationId, result, generation)
-      return result.cleared
-    } catch (error) { this.reportPrivateStateError(error, generation); return false }
+    const result = await this.mutatePrivateState(() => clear.call(this.options.client, conversationId, options ?? {}), generation)
+    this.applyPrivateState(conversationId, result, generation)
+    return result.cleared
   }
 
   async dispose(): Promise<void> {
@@ -334,6 +335,24 @@ export class ConversationListController extends ObservableStore<ConversationList
       isUnread: stored.unreadCount > 0 || stored.unreadCountCapped || state.unreadMarkedAt !== null,
     })
     this.summaries = summaries; this.emit()
+  }
+  /** A disposed, retired (session ended) or session-evicted store never sends a private-state mutation: on
+   * a shared client the request could go out under a replacement login, and a private marker must never be
+   * written under another user. The session is compared on every path: a custom `pageLoader` lets reads
+   * run without one (`current`), but a marker is the bound user's. Rejected without touching `error` (there
+   * is no live snapshot to report into).
+   */
+  private assertActive(): void {
+    if (!this.current(this.generation) || this.sessionIdentity !== this.options.client.sessionIdentity) {
+      throw new Error('ConversationListController is not active')
+    }
+  }
+  /** Run a mark/clear request; a failure is reported through `error` (while this load is current) and
+   * rethrown, so the caller's promise rejects and the row is kept.
+   */
+  private async mutatePrivateState<T>(request: () => Promise<T>, generation: number): Promise<T> {
+    try { return await request() }
+    catch (error) { this.reportPrivateStateError(error, generation); throw error }
   }
   private reportPrivateStateError(error: unknown, generation: number): void {
     if (!this.current(generation)) return
