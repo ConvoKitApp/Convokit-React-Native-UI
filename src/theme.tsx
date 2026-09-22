@@ -7,6 +7,10 @@ export interface ConvoKitUiTheme {
     outgoingText: string; pending: string;
     /** Unread badge background on inbox rows; unset means `primary`, so a re-themed accent carries over. */
     badge?: string
+    /** Tint of a row `jumpToMessage` landed on; unset means `primary` at low opacity, so a re-themed
+     * accent carries over exactly as it does for `badge`.
+     */
+    highlight?: string
   }
   spacing: { xs: number; sm: number; md: number; lg: number; xl: number }
   radius: { sm: number; md: number; lg: number; avatar: number }

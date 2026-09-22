@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState, type ReactElement, type ReactNode } from 'react'
 import {
-  ActivityIndicator, Alert, FlatList, Image, Pressable, StyleSheet, Text, TextInput, View, type AlertButton,
+  AccessibilityInfo, ActivityIndicator, Alert, FlatList, Image, Pressable, StyleSheet, Text, TextInput, View,
+  type AlertButton,
 } from 'react-native'
 import type { Conversation, InboxSummary, Message, MessageMedia, Participant, ReadPosition } from '@convokitapp/react-native'
 import { ComposerDraft } from './composer-draft'
-import { isConvoKitPendingMessage, resolveReaderIds } from './conversation-controller'
+import { isConvoKitPendingMessage, resolveReaderIds, type ReplyPreviewEntry } from './conversation-controller'
 import { useControllerState } from './hooks'
 import { conversationPreview, previewBody, unreadBadge } from './inbox'
 import { useConvoKitTheme } from './theme'
@@ -13,6 +14,11 @@ type AsyncAction = () => void | Promise<void>
 
 /** Message and inbox times in the device zone. */
 const formatMessageTime = (date: Date): string => date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+
+/** A colour at ~16% alpha: an 8-digit hex when the token is a plain 6-digit one, otherwise the colour
+ * unchanged. Lets the jump highlight fall back to the themed accent without dimming the row's content.
+ */
+const lowOpacity = (color: string): string => /^#[0-9a-fA-F]{6}$/.test(color) ? `${color}29` : color
 
 export interface ConversationRowContext {
   conversation: Conversation; index: number; onPress: () => void
@@ -38,6 +44,24 @@ export interface MessageRowContext {
    * only the default row shows the built-in `Alert` when no `confirmDelete` is set.
    */
   remove?: () => Promise<boolean>
+  /** 0.9: whether the row may be quoted here: the view was given `onReplyToMessage`, the row is
+   * confirmed and the caller's role is not `READ`. Unlike `canEdit` this is not restricted to the
+   * caller's own rows and is never routed through `canEditMessage`: an edit-eligibility override must
+   * not suppress Reply on other members' messages.
+   */
+  canReply: boolean
+  /** 0.9: present only while `canReply`: hand the row to `onReplyToMessage`. */
+  reply?: () => void
+  /** 0.9: present only when `message.replyToMessageId` is set — the resolved quoted parent, or the
+   * terminal `'unavailable'` when it is gone. Absent while the parent is not yet resolved, which is a
+   * distinct state from `'unavailable'`: render the reference without its text, never the unavailable
+   * copy.
+   */
+  replyPreview?: ReplyPreviewEntry
+  /** 0.9: present only when `message.replyToMessageId` is set and the view was given `onJumpToMessage`:
+   * show the quoted message, loading it when it is outside the window.
+   */
+  jumpToReplyTarget?: () => void
 }
 export interface MediaContext { media: MessageMedia; message: Message; isCurrentUser: boolean }
 
@@ -165,6 +189,29 @@ export interface MessageListViewProps {
    * row's `remove()` asks for; resolve `true` to delete.
    */
   confirmDelete?: (message: Message) => boolean | Promise<boolean>
+  /** 0.9: quote a row in the composer. Absent means no reply action anywhere (rows render as in 0.8). */
+  onReplyToMessage?: (message: Message) => void
+  /** 0.9: the resolved quoted parents by message id, as the room controller publishes them. A key that
+   * is missing is "not yet resolved" and renders the reference without its text; `'unavailable'` renders
+   * the unavailable placeholder. Follows the `readAtByUserId` map idiom.
+   */
+  replyPreviewByMessageId?: ReadonlyMap<string, ReplyPreviewEntry>
+  /** 0.9: show a message, loading it when it is outside the window. Absent means the quoted block is
+   * rendered but not activatable and no jump affordance appears.
+   */
+  onJumpToMessage?: (messageId: string) => void
+  /** 0.9: the row a jump landed on; it is tinted with `colors.highlight` until the host clears it. */
+  highlightedMessageId?: string | null
+  /** 0.9: whether rows newer than the rendered window exist; drives the newer-edge pagination trigger,
+   * exactly as `hasOlderMessages` drives the older one. Only a jumped window ever reports true.
+   */
+  hasNewerMessages?: boolean
+  isLoadingNewer?: boolean
+  onLoadNewer?: AsyncAction
+  /** 0.9: a user-initiated scroll happened, so the jump highlight should be cleared. Fired only by a
+   * drag, never by the programmatic scroll a jump performs.
+   */
+  onHighlightDismissed?: () => void
 }
 
 /** The default row's built-in delete confirmation: an alert with `Delete` and `Cancel`; dismissing it declines. */
@@ -176,10 +223,21 @@ function confirmDeletion(): Promise<boolean> {
   ))
 }
 
+/** How many times a failed `scrollToIndex` is retried after nudging the list toward the target. Rows are
+ * variable height, so there is no `getItemLayout` and the target may be outside the render window.
+ */
+const scrollToIndexRetries = 3
+
 export function ConvoKitMessageListView(props: MessageListViewProps): ReactElement {
   const theme = useConvoKitTheme()
   const chronological = [...props.messages]
+  // `reverse()` reverses in place and returns the same array, so `chronological` and `data` are one
+  // object either way and the index below is the position in the rendered `data` array — which is what
+  // `scrollToIndex` needs and what `chronologicalIndex` has always carried. 0.9.0 leaves that value as
+  // it is. The map also replaces a per-row `findIndex`, which scanned the list once per row.
   const data = props.reverse === false ? chronological : chronological.reverse()
+  const indexById = new Map<string, number>()
+  for (let index = 0; index < data.length; index++) indexById.set(data[index]!.id, index)
   const listRef = useRef<FlatList<Message>>(null)
   const previousNewestId = useRef<string | undefined>(chronological.at(-1)?.id)
   const newest = chronological.at(-1)
@@ -193,6 +251,26 @@ export function ConvoKitMessageListView(props: MessageListViewProps): ReactEleme
     })
     return () => cancelAnimationFrame(frame)
   }, [newest, props.currentUserId, props.reverse])
+  // The jump scroll: only an explicit `jumpToMessage` sets `highlightedMessageId`, so autoscroll, page
+  // loads and live inserts never move the view this way. A target that is not rendered yet (the window
+  // is still being replaced) is retried by the next render, and the ref keeps one target to one scroll.
+  const highlightedId = props.highlightedMessageId ?? null
+  const scrolledTo = useRef<string | null>(null)
+  const retries = useRef(0)
+  const retryTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  useEffect(() => () => clearTimeout(retryTimer.current), [])
+  useEffect(() => {
+    if (!highlightedId) { scrolledTo.current = null; return }
+    if (scrolledTo.current === highlightedId) return
+    const index = indexById.get(highlightedId)
+    if (index === undefined) return
+    scrolledTo.current = highlightedId
+    retries.current = 0
+    listRef.current?.scrollToIndex({ index, viewPosition: 0.5, animated: true })
+    // The highlight is purely visual, so the move is announced instead: the platform's equivalent of
+    // moving focus to the row a jump landed on.
+    AccessibilityInfo.announceForAccessibility?.('Showing the quoted message')
+  }, [highlightedId, indexById])
   const participants = new Map<string, Participant>()
   for (const participant of props.conversation.participants) {
     participants.set(participant.id, participant); participants.set(participant.appUserId, participant)
@@ -201,6 +279,10 @@ export function ConvoKitMessageListView(props: MessageListViewProps): ReactEleme
   const role = props.conversation.membership?.role ?? participants.get(props.currentUserId)?.role
   const eligible = (message: Message, mine: boolean): boolean =>
     !isConvoKitPendingMessage(message) && (props.canEditMessage ? props.canEditMessage(message) : mine && role !== 'READ')
+  // Reply eligibility is deliberately NOT the edit predicate: any member may quote any row, so the
+  // `mine` term is dropped, and the host's `canEditMessage` override is not consulted — an
+  // edit-eligibility override must not suppress Reply on other members' messages.
+  const replyable = (message: Message): boolean => !isConvoKitPendingMessage(message) && role !== 'READ'
   // The `remove()` handed to rows asks `confirmDelete` only when the host provided one; confirmation UI is
   // otherwise the row's own (the default row asks first through `inlineConfirm`).
   const remove = async (message: Message): Promise<boolean> => {
@@ -216,6 +298,10 @@ export function ConvoKitMessageListView(props: MessageListViewProps): ReactEleme
     ? <>{props.renderLoadingOlder?.() ?? <ActivityIndicator accessibilityLabel="Loading older messages" />}</>
     : props.error ? <>{props.renderError?.(props.error, props.onLoadOlder ?? (() => undefined)) ??
       <ErrorState error={props.error} retry={props.onLoadOlder} />}</> : null
+  // The newer edge sits at the opposite end from the older one in both orientations, so its loader takes
+  // the slot the older loader leaves free. Nothing renders there without a jumped window.
+  const newerLoader = props.isLoadingNewer
+    ? <ActivityIndicator accessibilityLabel="Loading newer messages" /> : null
   return <FlatList
     ref={listRef}
     testID={props.testID}
@@ -226,26 +312,51 @@ export function ConvoKitMessageListView(props: MessageListViewProps): ReactEleme
     maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
     ListEmptyComponent={() => <>{props.renderEmpty?.() ??
       <Text style={[styles.center, { color: theme.colors.mutedText }]}>No messages yet</Text>}</>}
-    ListFooterComponent={props.reverse === false ? undefined : () => loader}
-    ListHeaderComponent={props.reverse === false ? () => loader : undefined}
+    ListFooterComponent={props.reverse === false ? (newerLoader ? () => newerLoader : undefined) : () => loader}
+    ListHeaderComponent={props.reverse === false ? () => loader : (newerLoader ? () => newerLoader : undefined)}
     onEndReachedThreshold={0.3}
     onEndReached={() => { if (props.hasOlderMessages && !props.isLoadingOlder) void props.onLoadOlder?.() }}
+    onStartReachedThreshold={0.3}
+    onStartReached={() => { if (props.hasNewerMessages && !props.isLoadingNewer) void props.onLoadNewer?.() }}
+    onScrollBeginDrag={() => props.onHighlightDismissed?.()}
+    onScrollToIndexFailed={info => {
+      // Variable-height rows mean no `getItemLayout`, so a target outside the render window fails: nudge
+      // to the estimated offset, let the list render that range, then try the index again a bounded
+      // number of times.
+      listRef.current?.scrollToOffset({ offset: info.averageItemLength * info.index, animated: false })
+      if (retries.current >= scrollToIndexRetries) return
+      retries.current += 1
+      clearTimeout(retryTimer.current)
+      retryTimer.current = setTimeout(() => {
+        listRef.current?.scrollToIndex({ index: info.index, viewPosition: 0.5, animated: true })
+      }, 100)
+    }}
     renderItem={({ item }) => {
-      const index = chronological.findIndex(row => row.id === item.id)
+      const index = indexById.get(item.id) ?? -1
       const mine = item.senderId === props.currentUserId
       const readerIds = readers(item)
       const canEdit = Boolean(props.onEditMessage) && eligible(item, mine)
       const canDelete = Boolean(props.onDeleteMessage) && eligible(item, mine)
+      const canReply = Boolean(props.onReplyToMessage) && replyable(item)
+      const parentId = item.replyToMessageId
+      const preview = parentId === undefined ? undefined : props.replyPreviewByMessageId?.get(parentId)
       const context: MessageRowContext = {
         message: item, chronologicalIndex: index, isCurrentUser: mine,
         ...(participants.get(item.senderId) ? { sender: participants.get(item.senderId)! } : {}), readerIds,
         isEdited: item.revision > 0, canEdit, canDelete,
         ...(canEdit ? { edit: () => props.onEditMessage?.(item) } : {}),
         ...(canDelete ? { remove: () => remove(item) } : {}),
+        canReply,
+        ...(canReply ? { reply: () => props.onReplyToMessage?.(item) } : {}),
+        ...(preview === undefined ? {} : { replyPreview: preview }),
+        ...(parentId !== undefined && props.onJumpToMessage
+          ? { jumpToReplyTarget: () => props.onJumpToMessage?.(parentId) } : {}),
       }
       return <>{props.renderMessage?.(context) ?? <DefaultMessageRow
         {...context} renderMedia={props.renderMedia} renderReadReceipt={props.renderReadReceipt}
         onAttachmentPress={props.onAttachmentPress} inlineConfirm={!props.confirmDelete}
+        isHighlighted={highlightedId === item.id}
+        senderName={(id: string) => participants.get(id)?.name ?? id}
       />}</>
     }}
   />
@@ -260,6 +371,12 @@ export interface ComposerContext {
   editing?: Message
   /** Leave edit mode: restores the unsent draft and calls `onCancelEdit`. */
   cancelEdit?: () => void
+  /** 0.9: the message the next send quotes (the host's `replyTarget`); flat, like `editing`. Editing and
+   * replying are mutually exclusive, so at most one of the two is ever present.
+   */
+  replying?: Message
+  /** 0.9: drop the reply target; calls `onCancelReply`. Present exactly while `replying` is. */
+  cancelReply?: () => void
 }
 
 export interface ConversationViewProps extends Omit<MessageListViewProps, 'conversation' | 'messages' | 'currentUserId'> {
@@ -285,6 +402,17 @@ export interface ConversationViewProps extends Omit<MessageListViewProps, 'conve
   onSaveEdit?: (message: Message, text: string) => boolean | void | Promise<boolean | void>
   /** 0.8: the user pressed Cancel; the view has already restored the stashed draft. */
   onCancelEdit?: () => void
+  /** 0.9: the host's reply target. While set the composer shows a cancellable strip naming the quoted
+   * message; the send itself carries the quote, so `onSendMessage` is unchanged. Null or absent is the
+   * 0.8 composer.
+   */
+  replyTarget?: Message | null
+  /** 0.9: the user pressed Cancel on the reply strip. */
+  onCancelReply?: () => void
+  /** 0.9: leave a jumped window and render the newest page again. Present only while the window is
+   * jumped; the view shows the `Jump to latest` control exactly when it is given.
+   */
+  onReturnToLatest?: AsyncAction
 }
 
 export function ConvoKitConversationView(props: ConversationViewProps): ReactElement {
@@ -294,6 +422,9 @@ export function ConvoKitConversationView(props: ConversationViewProps): ReactEle
   const draft = draftRef.current
   draft.onTyping = props.onTypingChanged
   const editing = props.editingMessage ?? null
+  // Editing and replying are mutually exclusive in the store; the view honours edit mode if a host ever
+  // sets both, so the composer never shows two modal states at once.
+  const replying = editing ? null : props.replyTarget ?? null
   draft.sync(editing)
   const { value } = useControllerState(draft)
   const setValue = (next: string) => draft.setValue(next)
@@ -315,6 +446,7 @@ export function ConvoKitConversationView(props: ConversationViewProps): ReactEle
     } finally { submitting.current = false }
   }
   const cancelEdit = () => { draft.cancel(); props.onCancelEdit?.() }
+  const cancelReply = () => props.onCancelReply?.()
   const names = (id: string) => props.displayNameForUser?.(id) ??
     props.conversation.participants.find(row => row.appUserId === id || row.id === id)?.name ?? id
   if (props.isInitialLoading && !props.messages.length) return <ActivityIndicator accessibilityLabel="Loading conversation" />
@@ -331,6 +463,11 @@ export function ConvoKitConversationView(props: ConversationViewProps): ReactEle
       </View>}
     {!!props.conversationError && <ErrorState error={props.conversationError} retry={props.onRefresh} />}
     <View style={styles.flex}><ConvoKitMessageListView {...props} /></View>
+    {!!props.onReturnToLatest && <Pressable
+      accessibilityRole="button" accessibilityLabel="Jump to latest messages"
+      onPress={() => void props.onReturnToLatest?.()}
+      style={[styles.jumpToLatest, { backgroundColor: theme.colors.surface, borderColor: theme.colors.border }]}
+    ><Text style={{ color: theme.colors.primary, fontWeight: '700' }}>Jump to latest</Text></Pressable>}
     {props.renderTypingIndicator?.(typingUserIds, names) ??
       (typingUserIds.size > 0 && <Text accessibilityLiveRegion="polite" style={{ paddingHorizontal: 16, color: theme.colors.mutedText }}>
         {[...typingUserIds].map(names).join(', ')} {typingUserIds.size === 1 ? 'is' : 'are'} typing…
@@ -339,7 +476,17 @@ export function ConvoKitConversationView(props: ConversationViewProps): ReactEle
       value, setValue, send: () => void send(), isSending: Boolean(props.isSending),
       ...(props.onAddAttachment ? { addAttachment: props.onAddAttachment } : {}),
       ...(editing ? { editing, cancelEdit } : {}),
+      ...(replying ? { replying, cancelReply } : {}),
     }) ?? <>
+      {!!replying && <View accessibilityLiveRegion="polite" style={[styles.editBanner, { backgroundColor: theme.colors.surface, borderColor: theme.colors.border }]}>
+        <View style={styles.flex}>
+          <Text style={{ color: theme.colors.primary, fontWeight: '700', fontSize: theme.typography.caption }}>Replying to {names(replying.senderId)}</Text>
+          <Text numberOfLines={1} style={{ color: theme.colors.mutedText }}>{replying.text ?? previewBody(replying)}</Text>
+        </View>
+        <Pressable accessibilityRole="button" accessibilityLabel="Cancel reply" hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} onPress={cancelReply}>
+          <Text style={{ color: theme.colors.primary, fontWeight: '700' }}>Cancel</Text>
+        </Pressable>
+      </View>}
       {!!editing && <View accessibilityLiveRegion="polite" style={[styles.editBanner, { backgroundColor: theme.colors.surface, borderColor: theme.colors.border }]}>
         <View style={styles.flex}>
           <Text style={{ color: theme.colors.primary, fontWeight: '700', fontSize: theme.typography.caption }}>Editing message</Text>
@@ -375,16 +522,50 @@ export function ConvoKitConversationView(props: ConversationViewProps): ReactEle
   </View>
 }
 
+/** The quoted block above a reply's text. Three branches, and the unresolved one is NOT the unavailable
+ * copy: a preview that has not been resolved yet shows the reference alone, because a batch that has not
+ * answered says nothing about whether the parent exists. The block stays activatable while the parent is
+ * gone, so the reader can still jump to where it was.
+ */
+function QuotedMessage(props: {
+  preview?: ReplyPreviewEntry; onPress?: () => void; senderName(id: string): string; isCurrentUser: boolean
+}): ReactElement {
+  const theme = useConvoKitTheme()
+  const unavailable = props.preview === 'unavailable'
+  const resolved = props.preview && props.preview !== 'unavailable' ? props.preview : null
+  const author = resolved ? props.senderName(resolved.senderId) : null
+  const body = resolved
+    ? (resolved.text?.trim() || (resolved.mediaCount > 0 ? `${resolved.mediaCount} attachment${resolved.mediaCount === 1 ? '' : 's'}` : ''))
+    : unavailable ? 'Original message unavailable' : ''
+  const tint = props.isCurrentUser ? theme.colors.outgoingText : theme.colors.mutedText
+  const label = unavailable ? 'Original message unavailable'
+    : author ? `Quoted message from ${author}` : 'Quoted message'
+  const quote = <View style={[styles.quote, { borderColor: props.isCurrentUser ? theme.colors.outgoingText : theme.colors.primary }]}>
+    {!!author && <Text numberOfLines={1} style={{ color: tint, fontWeight: '700', fontSize: theme.typography.caption }}>{author}</Text>}
+    {!!body && <Text numberOfLines={2} style={{ color: tint, fontSize: theme.typography.caption }}>{body}</Text>}
+  </View>
+  if (!props.onPress) return <View accessibilityLabel={label}>{quote}</View>
+  return <Pressable accessibilityRole="button" accessibilityLabel={label} onPress={props.onPress}>{quote}</Pressable>
+}
+
 /** `inlineConfirm`: the view has no `confirmDelete`, so the row asks with the built-in dialog before `remove()`. */
-function DefaultMessageRow(props: MessageRowContext & Pick<MessageListViewProps, 'renderMedia' | 'renderReadReceipt' | 'onAttachmentPress'> & { inlineConfirm: boolean }): ReactElement {
+function DefaultMessageRow(props: MessageRowContext & Pick<MessageListViewProps, 'renderMedia' | 'renderReadReceipt' | 'onAttachmentPress'> & {
+  inlineConfirm: boolean; isHighlighted?: boolean; senderName?: (id: string) => string
+}): ReactElement {
   const theme = useConvoKitTheme(); const pending = isConvoKitPendingMessage(props.message)
   const timeColor = props.isCurrentUser ? theme.colors.outgoingText : theme.colors.mutedText
+  const senderName = props.senderName ?? ((id: string) => id)
   const body = <>
     <View style={[styles.bubble, {
       backgroundColor: props.isCurrentUser ? theme.colors.outgoingBubble : theme.colors.incomingBubble,
       borderColor: theme.colors.border,
     }]}>
       {!props.isCurrentUser && <Text style={{ color: theme.colors.primary, fontWeight: '700' }}>{props.sender?.name ?? props.message.senderId}</Text>}
+      {props.message.replyToMessageId !== undefined && <QuotedMessage
+        {...(props.replyPreview === undefined ? {} : { preview: props.replyPreview })}
+        {...(props.jumpToReplyTarget ? { onPress: props.jumpToReplyTarget } : {})}
+        senderName={senderName} isCurrentUser={props.isCurrentUser}
+      />}
       {!!props.message.text && <Text style={{ color: props.isCurrentUser ? theme.colors.outgoingText : theme.colors.text }}>{props.message.text}</Text>}
       {props.message.media.map((media, index) => <View key={media.id ?? `${media.type}-${index}`} style={{ marginTop: theme.spacing.sm }}>
         {props.renderMedia?.({ media, message: props.message, isCurrentUser: props.isCurrentUser }) ??
@@ -404,15 +585,26 @@ function DefaultMessageRow(props: MessageRowContext & Pick<MessageListViewProps,
     {props.isCurrentUser && !pending && props.readerIds.size > 0 && <>{props.renderReadReceipt?.(props.message, props.readerIds) ??
       <Text style={{ color: theme.colors.mutedText, fontSize: theme.typography.caption }}>Read by {props.readerIds.size}</Text>}</>}
   </>
-  const layout = { alignItems: props.isCurrentUser ? 'flex-end' as const : 'flex-start' as const, marginBottom: theme.spacing.md }
-  if (!props.edit && !props.remove) return <View style={layout}>{body}</View>
-  // An eligible row: a long press (or the `Message actions` accessibility action) opens the action sheet.
+  const layout = {
+    alignItems: props.isCurrentUser ? 'flex-end' as const : 'flex-start' as const, marginBottom: theme.spacing.md,
+    // The jump highlight: the accent at low opacity unless the theme names its own token, mirroring
+    // `colors.badge`. Cleared by the host after ~2 seconds or on a user-initiated scroll.
+    ...(props.isHighlighted ? {
+      backgroundColor: theme.colors.highlight ?? lowOpacity(theme.colors.primary),
+      borderRadius: theme.radius.md, padding: theme.spacing.xs,
+    } : {}),
+  }
+  // A row with no action available is not long-pressable and opens no sheet: the sheet must never open
+  // on `Cancel` alone.
+  if (!props.edit && !props.remove && !props.reply) return <View style={layout}>{body}</View>
   const remove = async () => {
     if (props.inlineConfirm && !await confirmDeletion()) return
     await props.remove?.()
   }
+  // An eligible row: a long press (or the `Message actions` accessibility action) opens the action sheet.
   const showActions = () => {
     const buttons: AlertButton[] = []
+    if (props.reply) buttons.push({ text: 'Reply', onPress: props.reply })
     if (props.edit) buttons.push({ text: 'Edit message', onPress: props.edit })
     if (props.remove) buttons.push({ text: 'Delete message', style: 'destructive', onPress: () => { void remove() } })
     buttons.push({ text: 'Cancel', style: 'cancel' })
@@ -463,6 +655,8 @@ const styles = StyleSheet.create({
   headerTitle: { flex: 1, fontSize: 17, fontWeight: '700' },
   composer: { borderTopWidth: StyleSheet.hairlineWidth, padding: 10, flexDirection: 'row', alignItems: 'flex-end', gap: 10 },
   editBanner: { borderTopWidth: StyleSheet.hairlineWidth, paddingHorizontal: 16, paddingVertical: 8, flexDirection: 'row', alignItems: 'center', gap: 12 },
+  quote: { borderLeftWidth: 3, paddingLeft: 8, paddingVertical: 2, gap: 1 },
+  jumpToLatest: { alignSelf: 'center', minHeight: 36, borderWidth: StyleSheet.hairlineWidth, borderRadius: 18, paddingHorizontal: 14, paddingVertical: 8, marginBottom: 6 },
   meta: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   sendButton: { minWidth: 72, minHeight: 48, paddingHorizontal: 12, paddingVertical: 12, alignItems: 'center', justifyContent: 'center' },
   input: { flex: 1, maxHeight: 120, minHeight: 42, borderWidth: StyleSheet.hairlineWidth, borderRadius: 18, paddingHorizontal: 12, paddingVertical: 9 },

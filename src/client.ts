@@ -1,7 +1,7 @@
 import type {
   ClearConversationUnreadOptions, ClearUnreadResult, ConversationPrivateState, ConvoKitClient, Conversation, InboxPage,
-  MarkConversationReadOptions, Message, MessageDeletedEvent, MessageEvent, MessageMedia, ReadEvent,
-  RealtimeConnectionEvent, RealtimeSubscription, TypingEvent,
+  MarkConversationReadOptions, Message, MessageContextPage, MessageDeletedEvent, MessageEvent, MessageMedia, ReadEvent,
+  RealtimeConnectionEvent, RealtimeSubscription, ReplyPreview, TypingEvent,
 } from '@convokitapp/react-native'
 
 export interface ConvoKitUiClient {
@@ -21,8 +21,14 @@ export interface ConvoKitUiClient {
     beforeCreatedAt?: Date; beforeId?: string
   }): Promise<Message[]>
   getMessage(id: string): Promise<Message>
+  /** Since 0.9 the input may carry `replyToMessageId`, the message in the same room the send quotes. It
+   * is omitted entirely when the composer has no reply target, so a send without a quote is byte-identical
+   * to 0.8; a target that is not in this conversation must reject with `code` `MESSAGE_NOT_FOUND`. Adapters
+   * written against the 0.8 signature still satisfy this one.
+   */
   sendMessage(input: {
     conversationId: string; clientMessageId?: string; text?: string; media?: MessageMedia[]
+    replyToMessageId?: string
   }): Promise<Message>
   /** Acknowledge through `options.throughMessageId` (the newest rendered message). Adapters that ignore the
    * target degrade to acknowledging the newest message on the server at request time; a target the server
@@ -53,6 +59,23 @@ export interface ConvoKitUiClient {
    * rejects.
    */
   deleteMessage?(messageId: string): Promise<void>
+  /** The 0.9 batch preview read: resolve the quoted parents of the replies on screen in one round trip.
+   * Pass every distinct `Message.replyToMessageId` the window renders; the SDK trims, de-duplicates and
+   * chunks at 50 per request. An id missing from a RESOLVED result is the only deletion signal — the
+   * quoted message is gone or was never in this room — and is never an error. Optional so 0.8 adapters
+   * keep compiling: without it the room controller reports `canResolveReplyPreviews: false` and renders
+   * every quoted block without its text.
+   */
+  getReplyPreviews?(conversationId: string, messageIds: string[]): Promise<ReplyPreview[]>
+  /** The 0.9 context window: one page of a room's history centred on `messageId`, or continued from a
+   * previous window's `olderCursor` / `newerCursor`. Exactly one of the three selectors is sent. An
+   * unknown, deleted or out-of-room `messageId` must reject with `code` `MESSAGE_NOT_FOUND`. Optional so
+   * 0.8 adapters keep compiling: without it `canJumpToMessages` is false, no jump affordance renders and
+   * `jumpToMessage` only highlights rows already in the window.
+   */
+  getMessageContext?(conversationId: string, options: {
+    messageId?: string; olderCursor?: string; newerCursor?: string; limit?: number
+  }): Promise<MessageContextPage>
   sendTyping(input: { conversationId: string; isTyping: boolean }): Promise<void>
   onConnectionEvent(handler: (event: RealtimeConnectionEvent) => void, ended: () => void): RealtimeSubscription
   onInboxChanged(handler: () => void): RealtimeSubscription
@@ -85,6 +108,12 @@ export class DefaultConvoKitUiClient implements ConvoKitUiClient {
     return this.sdk.editMessage(messageId, input)
   }
   deleteMessage(messageId: string) { return this.sdk.deleteMessage(messageId) }
+  getReplyPreviews(conversationId: string, messageIds: string[]) {
+    return this.sdk.getReplyPreviews(conversationId, messageIds)
+  }
+  getMessageContext(conversationId: string, options: Parameters<ConvoKitClient['getMessageContext']>[1]) {
+    return this.sdk.getMessageContext(conversationId, options)
+  }
   sendTyping(input: { conversationId: string; isTyping: boolean }) { return this.sdk.sendTyping(input) }
   onConnectionEvent(handler: (event: RealtimeConnectionEvent) => void, ended: () => void) {
     return this.sdk.realtime.onConnectionEvent({ onEvent: handler, onSessionEnded: ended })

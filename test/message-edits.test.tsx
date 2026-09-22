@@ -27,6 +27,7 @@ vi.mock('react-native', () => {
     ActivityIndicator: host('progress'), Image: host('img'), Text: host('span'), View: host('div'),
     TextInput: (props: Props) => { inputs.push(props); return textarea(props) },
     Pressable: (props: Props) => { pressed.push(props); return button(props) },
+    AccessibilityInfo: { announceForAccessibility: vi.fn() },
     Alert: { alert: vi.fn() },
     AppState: { currentState: 'active', addEventListener: vi.fn(() => ({ remove: vi.fn() })) },
     StyleSheet: { create: <T,>(styles: T) => styles, hairlineWidth: 1 },
@@ -76,7 +77,9 @@ const flush = () => new Promise(resolve => setTimeout(resolve, 0))
 const alerts = () => vi.mocked(Alert.alert).mock.calls as unknown as Array<[string, string | undefined, AlertButtons, unknown]>
 const buttons = (index: number) => alerts()[index]![2]
 const press = (index: number, label: string) => buttons(index).find(button => button.text === label)!.onPress?.()
-const row = () => pressed.find(props => typeof props.onLongPress === 'function')!
+/** The nth long-pressable row in render order; since 0.9 every confirmed row is one, because any
+ * member may quote any message. */
+const row = (index = 0) => pressed.filter(props => typeof props.onLongPress === 'function')[index]!
 const button = (label: string) => pressed.find(props => props.accessibilityLabel === label)!
 const callbacks = () => ({ onEditMessage: vi.fn(), onDeleteMessage: vi.fn(() => true) })
 
@@ -353,10 +356,15 @@ describe('bound conversation', () => {
     await controller.loadInitial()
     const idle = bound(controller)
     expect(idle).toContain('data-actions="messageActions:Message actions"')
-    expect(idle.match(/data-actions=/g)).toHaveLength(1)
+    // Since 0.9 the bound view wires Reply on every row, so both rows are long-pressable; only the
+    // caller's own one offers Edit and Delete. Rows render newest-first, so `mine` is the second.
+    expect(idle.match(/data-actions=/g)).toHaveLength(2)
     expect(idle).not.toContain('Editing message')
-    ;(row().onLongPress as () => void)()
-    press(0, 'Edit message')
+    ;(row(0).onLongPress as () => void)()
+    expect(buttons(0).map(action => action.text)).toEqual(['Reply', 'Cancel'])
+    ;(row(1).onLongPress as () => void)()
+    expect(buttons(1).map(action => action.text)).toEqual(['Reply', 'Edit message', 'Delete message', 'Cancel'])
+    press(1, 'Edit message')
     expect(controller.getSnapshot().editingMessage).toEqual(mine)
     pressed.length = 0
     const editing = bound(controller)
@@ -376,9 +384,9 @@ describe('bound conversation', () => {
     expect(sdk.sendTyping).toHaveBeenLastCalledWith({ conversationId: 'room', isTyping: false })
     pressed.length = 0
     bound(controller)
-    ;(row().onLongPress as () => void)()
-    press(1, 'Delete message')
-    press(2, 'Delete')
+    ;(row(1).onLongPress as () => void)()
+    press(2, 'Delete message')
+    press(3, 'Delete')
     await flush()
     expect(sdk.deleteMessage).toHaveBeenCalledWith('m1')
     expect(controller.getSnapshot().messages.map(row => row.id)).toEqual(['m2'])
@@ -390,8 +398,11 @@ describe('bound conversation', () => {
     await controller.loadInitial()
     controller.startEditing('m1')
     const html = bound(controller)
-    expect(html).not.toMatch(/data-actions|Editing message|Save message/)
+    expect(html).not.toMatch(/Editing message|Save message/)
     expect(html).toContain('aria-label="Send message"')
+    // Reply needs no adapter member beyond `sendMessage`, so it is the only action a 0.8 adapter offers.
+    ;(row(0).onLongPress as () => void)()
+    expect(buttons(0).map(action => action.text)).toEqual(['Reply', 'Cancel'])
     await controller.dispose()
   })
 })

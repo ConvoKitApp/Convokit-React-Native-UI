@@ -1,7 +1,9 @@
 export { DefaultConvoKitUiClient } from './client'
 export type { ConvoKitUiClient } from './client'
 export { ConversationController, isConvoKitPendingMessage, resolveReaderIds } from './conversation-controller'
-export type { ConversationControllerOptions, ConversationState } from './conversation-controller'
+export type {
+  ConversationControllerOptions, ConversationState, ConversationWindowMode, ReplyPreviewEntry,
+} from './conversation-controller'
 export { ConversationListController } from './conversation-list-controller'
 export type { ConversationListControllerOptions, ConversationListState } from './conversation-list-controller'
 export { filterConversations } from './filter'
@@ -26,5 +28,5 @@ export type { ConvoKitConversationListProps, ConvoKitConversationProps } from '.
 // them from this package alone (type-only: nothing is loaded from the peer at runtime).
 export type {
   ClearConversationUnreadOptions, ClearUnreadResult, ConversationMembership, ConversationPrivateState, EditMessageInput,
-  InboxEntry, InboxSummary, Message, ReadPosition,
+  InboxEntry, InboxSummary, Message, MessageContextOptions, MessageContextPage, ReadPosition, ReplyPreview,
 } from '@convokitapp/react-native'

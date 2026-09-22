@@ -1,5 +1,130 @@
 # Changelog
 
+## 0.9.0
+
+Quoted replies and jump-to-message. Requires the 0.9 backend and
+`@convokitapp/react-native` 0.9 (peer `>=0.9.0 <0.10.0`); the exact dev pins
+on `@convokitapp/react-native` and `@convokitapp/sdk` move to `0.9.0` with it.
+
+- Added: quote a message when sending. `ConversationState` gains
+  `replyTarget`, `ConversationController` gains `startReply(messageId)` and
+  `cancelReply()`, and `sendMessage()` carries the target's id, stamps it on
+  the optimistic row so the quoted block renders before acknowledgement, and
+  clears the target on success. Any member may quote any confirmed row (not
+  only the caller's own); pending, removed and unknown rows and a `READ` role
+  are refused, deleting the target row clears it, and editing and replying are
+  mutually exclusive.
+- Added: batched quoted-parent resolution. `ConversationState` gains
+  `replyPreviews`, an id → `ReplyPreview | 'unavailable'` map filled by **one**
+  `getReplyPreviews` request per page load, reconcile and burst of live
+  inserts — never one request per row. A parent already in the loaded window
+  is derived locally (text cut at 500 characters with `textTruncated` set) and
+  costs nothing. A missing key is the distinct "not yet resolved" state: an id
+  absent from a batch that *resolved* becomes the terminal `'unavailable'`,
+  while a batch that *rejects* writes no entry at all, surfaces through `error`
+  and is retried on the next trigger. Entries are invalidated by a
+  `message_deleted` or delete response for that id, by an edit of that row, and
+  by a reconnect (every non-terminal entry is marked stale), and entries no
+  rendered row references are dropped.
+- Added: `jumpToMessage(messageId)`, `returnToLatest()`,
+  `loadNewerMessages()`, `clearHighlight()` and the state they drive
+  (`windowMode`, `highlightedMessageId`, `hasNewerMessages`, `isLoadingNewer`).
+  A target already in the window is only highlighted; otherwise one
+  `getMessageContext` centred on it replaces the window and the store enters
+  `jumped` mode, where both ends page through the context cursors. A jump is a
+  window operation, never a re-open: the acknowledgement floor, the
+  tombstones, the private state captured when the room opened, the edit
+  session and the reply target all survive it. A coded 404 `MESSAGE_NOT_FOUND`
+  marks that preview `'unavailable'` instead of erroring; a jump is a no-op
+  while a send is in flight.
+- Added: `canJumpToMessages` and `canResolveReplyPreviews` on
+  `ConversationState`, and the controller options `replyPreviewWindowMs`
+  (default 250) and `highlightDurationMs` (default 2000).
+- Changed: while the window is jumped, realtime inserts are recorded but not
+  rendered, and no read is acknowledged — the newest rendered row is not the
+  room's newest, and an acknowledgement carrying the version captured at open
+  would clear the caller's unread marker anyway. Edits, revisions and
+  tombstones for rows inside the window still apply. `returnToLatest()` drains
+  the recorded rows into the rendered set, and acknowledges them, at the moment
+  it switches to `live` — before the newest-page request, so inserts arriving
+  during it merge under the usual precedence. A newer page that reports no
+  newer cursor runs `returnToLatest()` rather than flipping in place, and a
+  failed reload stays `jumped` with the window intact. `sendMessage()` awaits
+  `returnToLatest()` first while jumped and does not send if it fails, leaving
+  `isSending` false and the draft and the reply target untouched.
+- Changed: a queued reconcile of a jumped window no longer refetches the
+  newest N rows (which never covers a window further back than the page cap).
+  It re-reads the window with one bounded, centred `getMessageContext`
+  anchored at the jump target, or at the window's midpoint once the window has
+  been paged, tombstones only inside the range the response returned, and
+  leaves the owed tail reconcile owed so it runs on the return to live.
+  `getConversation` still runs exactly as in live mode.
+- Added: `MessageListViewProps` gains `onReplyToMessage`,
+  `replyPreviewByMessageId`, `onJumpToMessage`, `highlightedMessageId`,
+  `hasNewerMessages`, `isLoadingNewer`, `onLoadNewer` and
+  `onHighlightDismissed`; `ConversationViewProps` adds `replyTarget`,
+  `onCancelReply` and `onReturnToLatest`. Without the new callbacks the
+  rendered markup is the 0.8.0 markup.
+- Added: `MessageRowContext` gains the flat siblings `canReply`, `reply?`,
+  `replyPreview?` and `jumpToReplyTarget?`, and `ComposerContext` gains
+  `replying?` and `cancelReply?` (flat, like `editing` / `cancelEdit`).
+- Added: default rows show `Reply` in the long-press `Alert` sheet ahead of
+  `Edit message` and `Delete message`, and a quoted block above the text of a
+  row that carries a reference — the parent's author and text (or its
+  attachment count), `Original message unavailable` once the parent is gone, or
+  the reference alone while it is not yet resolved. The block is activatable
+  while `onJumpToMessage` is given, including once the parent is gone.
+- Changed: a row whose only would-be action is unavailable is not wrapped in a
+  long-pressable and opens no action sheet, so the sheet never offers `Cancel`
+  alone. Conversely, because any member may quote any row, a room where the
+  viewer can reply now makes every confirmed row long-pressable — including
+  other members' messages, which previously rendered as a plain view.
+- Added: the default composer shows a cancellable reply strip (a polite live
+  region) reading `Replying to <name>` with `Cancel` (accessible name
+  `Cancel reply`) while `replyTarget` is set. The primary action stays
+  `Send message`.
+- Added: `ConvoKitConversationView` renders a `Jump to latest` control
+  (accessible name `Jump to latest messages`) exactly when `onReturnToLatest`
+  is given, and `ConvoKitMessageListView` gains a newer-edge pagination
+  trigger on the list's start edge plus a `Loading newer messages` indicator at
+  that edge. Both are inert unless `hasNewerMessages` is true, which only a
+  jumped window reports.
+- Added: `ConvoKitUiTheme.colors.highlight`, the tint of a jumped-to row;
+  unset means the accent at low opacity, exactly as `colors.badge` falls back
+  to `colors.primary`. The highlight lasts about two seconds, the move is
+  announced through `AccessibilityInfo`, and a drag clears it early.
+- Changed: scrolling to a row uses `scrollToIndex` against the rendered list,
+  with a new `onScrollToIndexFailed` that nudges to an estimated offset and
+  re-attempts at most three times (variable-height rows mean no
+  `getItemLayout`). The per-row index is now read from an id → index map built
+  once per render instead of a `findIndex` per row, removing a quadratic scan;
+  `MessageRowContext.chronologicalIndex` keeps the value it has always
+  carried.
+- Added: `ConvoKitUiClient` gains the optional
+  `getReplyPreviews(conversationId, messageIds)` and
+  `getMessageContext(conversationId, options)`, and its `sendMessage` input
+  gains the optional `replyToMessageId`; `DefaultConvoKitUiClient` implements
+  all three. Adapters without the two new members keep compiling and a 0.8
+  adapter still satisfies the widened `sendMessage`. Against a 0.8 backend both
+  new routes answer with an uncoded 404, which is never read as "message
+  gone": after the first such rejection the matching capability flag turns
+  false for the life of the controller and the affordances disappear instead of
+  failing repeatedly.
+- Added: `src/index.ts` re-exports the new types — `ConversationWindowMode`
+  and `ReplyPreviewEntry` from this package, and (type-only)
+  `MessageContextOptions`, `MessageContextPage` and `ReplyPreview` from the
+  core.
+- Docs: README gains "Quoted replies and jump to message" and worked samples
+  for the new render callbacks and controlled props; the 0.8.x patch-version
+  prose is retired.
+- Mixed fleet, sending: a pre-0.9 backend parses only `text` and `media`, so it
+  DROPS an unknown `replyToMessageId` and stores the message with no reference.
+  The optimistic row shows the quote and the confirmed row replaces it without
+  one, so the quote visibly disappears on send. The message itself is delivered;
+  only the reference is lost. This is not detected — the send response is the
+  only signal, and acting on it would mean a second request or rewriting a row
+  that is already delivered.
+
 ## 0.8.1
 
 Parity patch against `@convokitapp/react-ui` 0.8.0 for the read-position, inbox

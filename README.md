@@ -21,7 +21,8 @@ All major rows and states accept render callbacks, and `ConvoKitUiProvider`
 provides platform-neutral theme tokens.
 
 Pagination, optimistic sends, realtime reconciliation, deletion tombstones,
-edit mode for the caller's own messages, typing indicators, read receipts, and
+edit mode for the caller's own messages, quoted replies and jump-to-message
+windows, typing indicators, read receipts, and
 media rendering live in shared controllers. Navigation, safe areas, pickers, downloads, and attachment
 opening stay behind application callbacks. This package deliberately imports
 neither Expo modules nor app-specific native libraries, keeping a future
@@ -182,7 +183,7 @@ another user) is dropped. `clearUnread`
 resolves the response's `cleared`: whether this request removed the marker,
 not whether the room is read. A stale `ifVersion` or an unmarked room resolves
 `false` with the current state applied. A request failure sets `error`, keeps
-the row and rejects (since 0.8.1; catch the promise), so only a `cleared:
+the row and rejects (catch the promise), so only a `cleared:
 false` answer resolves `false`. An adapter without the two members makes both
 methods reject, and so does a controller that is not active: disposed, retired
 after the session ended, bound to a session the shared client has since
@@ -322,8 +323,8 @@ text, like `onSendMessage`) and `onCancelEdit`. Without the callbacks nothing
 new renders. Custom rows receive `isEdited`, `canEdit`, `canDelete` and, only
 while allowed, `edit()` and `remove()` on `MessageRowContext`. `remove()` asks
 `confirmDelete` when the view was given one and otherwise calls
-`onDeleteMessage` at once (since 0.8.1; it resolves whether the row was
-deleted): confirmation UI is the custom row's own. Only the default row shows
+`onDeleteMessage` at once, resolving whether the row was deleted:
+confirmation UI is the custom row's own. Only the default row shows
 the built-in `Delete this message?` dialog when no `confirmDelete` is set.
 The bound `ConvoKitConversation` wires the controller (`editingMessage`,
 `startEditing`, `saveEdit`, `cancelEditing`, `deleteMessage`) only when the
@@ -344,6 +345,154 @@ for members who already received them. Mixed fleet: a 0.7 view ignores
 actions but every save and delete fails with an uncoded 404 that keeps the
 row and the draft.
 
+## Quoted replies and jump to message
+
+Since 0.9 a message can quote another message in the same room, and the reader
+can jump to the quoted one even when it is far outside the loaded window. It
+needs the 0.9 backend and `@convokitapp/react-native` 0.9. Rows carry the
+core's `Message.replyToMessageId` (absent when the row is not a reply); the
+reference is write-once, so an edit never changes it and it survives the
+deletion of the message it points at. Consumer-built `Message` literals may
+omit the key.
+
+Controller members. `ConversationState` gains `replyTarget` (the message the
+next send quotes, null outside reply mode), `replyPreviews` (quoted parents by
+message id), `highlightedMessageId`, `windowMode` (`live` or `jumped`),
+`hasNewerMessages`, `isLoadingNewer`, and `canJumpToMessages` /
+`canResolveReplyPreviews` (whether the adapter implements the 0.9 members).
+`startReply(messageId)` quotes one of the room's rendered messages — any
+member's row, not only the caller's own — and is a no-op for pending, removed
+or unknown rows and for a `READ` role when the conversation reports one;
+`cancelReply()` drops it. The next `sendMessage()` carries the target, stamps
+it on the optimistic row so the quoted block renders before acknowledgement,
+and clears `replyTarget` on success. Entering edit mode clears the reply
+target and starting a reply leaves edit mode: the composer has one modal
+state. Deleting the target row clears it too.
+
+Preview resolution is batched, never one request per row. After every page
+load, reconcile and burst of live inserts the controller issues **one**
+`getReplyPreviews` call for the distinct `replyToMessageId` values the
+rendered rows reference; the SDK chunks at 50 per request. A parent that is
+itself in the loaded window is derived locally (text cut at 500 characters
+with `textTruncated` set) and costs nothing. `replyPreviews` has three states
+per id: a `ReplyPreview`, the terminal `'unavailable'`, and **no entry at
+all**, which means "not resolved yet" — render the reference without its text,
+never the unavailable copy. An id missing from a batch that *resolved* is the
+only deletion signal and becomes `'unavailable'` for good; a batch that
+*rejects* writes no entry for any of its ids, surfaces through `error` and is
+retried on the next trigger. A cached entry is invalidated by a
+`message_deleted` (or a delete response) for that id, by an edit of that row,
+and by a reconnect, which marks every non-terminal entry stale. Entries no
+rendered row references are dropped, so the map stays bounded by the window.
+
+Jumping. `jumpToMessage(messageId)` highlights a row that is already in the
+window without a request. Otherwise one `getMessageContext` centred on the id
+**replaces** the window, `windowMode` becomes `jumped` and `hasOlderMessages`
+/ `hasNewerMessages` come from the response's cursors. A jump is a window
+operation, never a re-open: the acknowledgement floor, the tombstones, the
+private state captured when the room opened, the edit session and the reply
+target all survive it, and the initial-load path never runs. A coded 404
+`MESSAGE_NOT_FOUND` — the guaranteed answer once the quoted message is
+deleted — marks that preview `'unavailable'` instead of surfacing an error and
+leaves the window untouched; any other failure sets `error` and also leaves it
+untouched. `jumpToMessage` is a no-op while a send is in flight, so a
+replacement can never strand a pending row.
+
+While jumped: both ends page through `getMessageContext` and the stored
+cursors (`loadOlderMessages()` as usual, `loadNewerMessages()` for the newer
+end), realtime inserts are **recorded but not rendered**, and no read is
+acknowledged (the newest rendered row is not the room's newest). Edits,
+revisions and tombstones for rows inside the window still apply. A queued
+reconcile does not walk the history: it re-reads the jumped window with one
+bounded, centred request anchored at the jump target (or at the window's
+midpoint once the window has been paged), tombstones only inside the range the
+response returned, and leaves the owed tail reconcile owed so it runs on the
+return to live.
+
+`returnToLatest()` is the only way back. It sets `windowMode = 'live'` before
+issuing the newest-page request — never after the response — so inserts
+arriving during it merge under the usual precedence, and the rows recorded
+while jumped join the rendered set, and are acknowledged, at that moment. A
+newer page that reports no newer cursor does **not** flip the window in place:
+that answer was only true at the server's query time, so `returnToLatest()`
+runs instead. If the reload fails the store stays `jumped` with the window
+intact, keeps the affordance and surfaces the error; it never lands in `live`
+on an unreloaded window. `sendMessage()` awaits `returnToLatest()` first when
+the window is jumped and does not send if it fails, leaving `isSending` false
+and the draft and the reply target untouched.
+
+Default rows. A row is replyable when the view was given `onReplyToMessage`,
+the row is confirmed and the caller's role is not `READ` — any member may
+quote any message, so unlike editing this is not limited to the caller's own
+rows and the `canEditMessage` override is deliberately not consulted. `Reply`
+joins the long-press `Alert` sheet ahead of `Edit message` and
+`Delete message`; a row whose only would-be action is unavailable is not
+long-pressable at all, so the sheet never opens on `Cancel` alone. A row that
+carries `replyToMessageId` shows a quoted block above its text with the
+parent's author and text (or its attachment count), `Original message
+unavailable` once the parent is gone, or the reference alone while it is not
+yet resolved. The block is a button when the view was given
+`onJumpToMessage`, with the accessible name `Quoted message from <author>`,
+`Original message unavailable` or `Quoted message`; it stays activatable while
+the parent is gone. The jumped-to row is tinted with `colors.highlight` (the
+themed accent at low opacity when the token is unset, exactly as `colors.badge`
+falls back) for about two seconds, and the move is announced through
+`AccessibilityInfo`; a drag clears the highlight early.
+
+Default composer. While `replyTarget` is set a cancellable strip above the
+input (a polite live region) reads `Replying to <name>` with the quoted text
+beside `Cancel` (accessible name `Cancel reply`). Sending clears it,
+cancelling clears it, and the primary action stays `Send message`: the quote
+rides on the store's send, not on a new callback. Custom composers receive the
+additive `replying` (the message) and `cancelReply` on the `renderComposer`
+input (`ComposerContext`), flat, as `editing` / `cancelEdit` are.
+
+Controlled views. `ConvoKitMessageListView` accepts `onReplyToMessage`,
+`replyPreviewByMessageId` (a `ReadonlyMap<string, ReplyPreview | 'unavailable'>`,
+the `readAtByUserId` idiom), `onJumpToMessage(messageId)`,
+`highlightedMessageId`, `hasNewerMessages`, `isLoadingNewer`, `onLoadNewer`
+and `onHighlightDismissed`; `ConvoKitConversationView` adds `replyTarget`,
+`onCancelReply` and `onReturnToLatest`, and renders the `Jump to latest`
+control (accessible name `Jump to latest messages`) exactly when
+`onReturnToLatest` is given. The newer-edge pagination trigger is the list's
+start edge — the opposite one from `onLoadOlder` — and only fires while
+`hasNewerMessages` is true, which only a jumped window reports. Without the
+new callbacks nothing new renders and the markup is the 0.8 markup. Custom
+rows receive `canReply` and, only where they apply, `reply()`, `replyPreview`
+and `jumpToReplyTarget()` on `MessageRowContext`. The bound
+`ConvoKitConversation` wires all of it from the controller, passing
+`onJumpToMessage` only while `canJumpToMessages` and `onReturnToLatest` only
+while the window is jumped, and takes `replyPreviewWindowMs` (the live-insert
+batching window, default 250) and `highlightDurationMs` (default 2000).
+
+Scrolling to a row uses `scrollToIndex` against the rendered list, with
+`onScrollToIndexFailed` nudging to an estimated offset and re-attempting at
+most three times — rows are variable height, so there is no `getItemLayout`
+and a target outside the render window cannot be measured up front.
+`MessageRowContext.chronologicalIndex` is unchanged: with the default
+orientation it has always been the rendered (visual) position, and 0.9 does
+not move it.
+
+0.9.0 adapter change (additive): `ConvoKitUiClient` gains the optional
+`getReplyPreviews(conversationId, messageIds)` and
+`getMessageContext(conversationId, { messageId?, olderCursor?, newerCursor?,
+limit? })`, and `sendMessage`'s input gains the optional `replyToMessageId`;
+`DefaultConvoKitUiClient` implements all three. Adapters without the two new
+members keep compiling, and a 0.8 adapter still satisfies the widened
+`sendMessage`: `canJumpToMessages` / `canResolveReplyPreviews` are then false,
+no jump affordance renders and quoted blocks show the reference without text.
+
+Mixed fleet. Against a 0.8 backend both new routes answer Express's unmatched
+route with an **uncoded** 404, which is not "message gone": the preview batch
+is treated as unresolved (never `'unavailable'`), a jump leaves the window
+untouched, the failure surfaces once, and after the first such rejection the
+corresponding capability flag turns false for the life of the controller so
+the affordances disappear instead of failing repeatedly. A coded
+`MESSAGE_NOT_FOUND` never trips that — it is a real missing target. Sending a
+quote to a 0.8 backend is not rejected: the backend ignores the unknown body
+key, so the message is sent without its reference and renders with no quoted
+block. A 0.8 view against the 0.9 backend ignores `replyToMessageId` entirely.
+
 ## Controlled components
 
 Use `ConvoKitConversationListView`, `ConvoKitConversationView` and
@@ -360,6 +509,11 @@ call `setVisible(false)` while the room is not on screen (or reuse
 Edit mode is a pure function of `editingMessage` plus the callbacks: pass the
 controller's `editingMessage`, `startEditing`, `saveEdit`, `cancelEditing` and
 `deleteMessage` (or your own state); leave them out and no action renders.
+Reply and jump state works the same way: pass `replyTarget`, `replyPreviews`,
+`highlightedMessageId`, `hasNewerMessages` and `isLoadingNewer` with
+`startReply`, `cancelReply`, `jumpToMessage`, `loadNewerMessages`,
+`returnToLatest` and `clearHighlight`, or leave them out and nothing new
+renders.
 
 ```tsx
 import { Alert, Pressable, Text } from 'react-native'
@@ -391,6 +545,17 @@ function Room({ roomId }: { roomId: string }) {
     onSaveEdit={(_message, text) => controller.saveEdit(text)}
     onCancelEdit={() => controller.cancelEditing()}
     onDeleteMessage={message => controller.deleteMessage(message.id)}
+    replyTarget={state.replyTarget}
+    replyPreviewByMessageId={state.replyPreviews}
+    highlightedMessageId={state.highlightedMessageId}
+    hasNewerMessages={state.hasNewerMessages}
+    isLoadingNewer={state.isLoadingNewer}
+    onReplyToMessage={message => controller.startReply(message.id)}
+    onCancelReply={() => controller.cancelReply()}
+    onJumpToMessage={messageId => void controller.jumpToMessage(messageId)}
+    onLoadNewer={() => controller.loadNewerMessages()}
+    onHighlightDismissed={() => controller.clearHighlight()}
+    {...(state.windowMode === 'jumped' ? { onReturnToLatest: () => void controller.returnToLatest() } : {})}
     confirmDelete={message => new Promise<boolean>(resolve => Alert.alert(
       'Delete this message?', message.text ?? undefined,
       [{ text: 'Keep', style: 'cancel', onPress: () => resolve(false) }, { text: 'Delete', style: 'destructive', onPress: () => resolve(true) }],
@@ -443,19 +608,29 @@ typing indicator, composer, and the loading, empty and error states.
   {...roomProps}
   renderReadReceipt={(_message, readerIds) => <Text>{readerIds.size ? `Seen by ${readerIds.size}` : 'Sent'}</Text>}
   renderMedia={({ media }) => media.type === 'location' ? <MyMap location={media} /> : undefined}
-  renderMessage={({ message, isCurrentUser, isEdited, edit, remove }) => (
+  renderMessage={({ message, isCurrentUser, isEdited, edit, remove, reply, replyPreview, jumpToReplyTarget }) => (
     <View style={{ alignItems: isCurrentUser ? 'flex-end' : 'flex-start' }}>
+      {message.replyToMessageId !== undefined && <Pressable accessibilityRole="button" onPress={jumpToReplyTarget}>
+        <Text numberOfLines={2}>
+          {replyPreview === 'unavailable' ? 'Original message unavailable' : replyPreview?.text ?? ''}
+        </Text>
+      </Pressable>}
       <Text>{message.text}</Text>
       {isEdited && <Text accessibilityLabel="Edited">(edited)</Text>}
+      {reply && <Pressable accessibilityRole="button" onPress={reply}><Text>Reply</Text></Pressable>}
       {edit && <Pressable accessibilityRole="button" onPress={edit}><Text>Edit</Text></Pressable>}
       {remove && <Pressable accessibilityRole="button" onPress={() => void remove()}><Text>Delete</Text></Pressable>}
     </View>
   )}
-  renderComposer={({ value, setValue, send, isSending, editing, cancelEdit }) => (
+  renderComposer={({ value, setValue, send, isSending, editing, cancelEdit, replying, cancelReply }) => (
     <View>
       {editing && <View>
         <Text>Editing: {editing.text}</Text>
         <Pressable accessibilityRole="button" accessibilityLabel="Cancel editing" onPress={cancelEdit}><Text>Cancel</Text></Pressable>
+      </View>}
+      {replying && <View>
+        <Text>Replying to: {replying.text}</Text>
+        <Pressable accessibilityRole="button" accessibilityLabel="Cancel reply" onPress={cancelReply}><Text>Cancel</Text></Pressable>
       </View>}
       <TextInput value={value} onChangeText={setValue} onSubmitEditing={send} />
       <Pressable accessibilityRole="button" disabled={isSending} onPress={send}><Text>{editing ? 'Save' : 'Send'}</Text></Pressable>
@@ -470,9 +645,13 @@ when that action is available to the viewer. A custom row's `remove()` asks
 `confirmDelete` when the view was given one and otherwise calls
 `onDeleteMessage` at once, so the row above owns its confirmation UI unless
 the host passes `confirmDelete`; the default row keeps the built-in dialog.
-`ConvoKitUiProvider` supplies the theme tokens (`colors.badge` included) that
-the default rows read through `useConvoKitTheme`.
+A row's `reply` is present exactly when the viewer may quote it, and
+`replyPreview` / `jumpToReplyTarget` only when the row carries a reference: a
+`replyPreview` of `undefined` means the quoted parent is not resolved yet, not
+that it is gone. `ConvoKitUiProvider` supplies the theme tokens
+(`colors.badge` and `colors.highlight` included) that the default rows read
+through `useConvoKitTheme`.
 
-Version 0.8.1 requires `@convokitapp/react-native` 0.8.x (peer
-`>=0.8.0 <0.9.0`). Publish `@convokitapp/react-native` before publishing this
+Version 0.9.0 requires `@convokitapp/react-native` 0.9.x (peer
+`>=0.9.0 <0.10.0`). Publish `@convokitapp/react-native` before publishing this
 package.

@@ -55,7 +55,9 @@ export function ConvoKitConversationList(props: ConvoKitConversationListProps): 
 
 export interface ConvoKitConversationProps extends Omit<MessageListViewProps,
   'conversation' | 'messages' | 'currentUserId' | 'readAtByUserId' | 'readPositionByUserId' | 'onLoadOlder' |
-  'hasOlderMessages' | 'isLoadingOlder' | 'error' | 'onEditMessage' | 'onDeleteMessage'> {
+  'hasOlderMessages' | 'isLoadingOlder' | 'error' | 'onEditMessage' | 'onDeleteMessage' |
+  'onReplyToMessage' | 'replyPreviewByMessageId' | 'onJumpToMessage' | 'highlightedMessageId' |
+  'hasNewerMessages' | 'isLoadingNewer' | 'onLoadNewer' | 'onHighlightDismissed'> {
   conversationId: string
   sdk?: ConvoKitClient
   client?: ConvoKitUiClient
@@ -64,6 +66,10 @@ export interface ConvoKitConversationProps extends Omit<MessageListViewProps,
   markReadOnLoad?: boolean
   markReadOnReceive?: boolean
   typingTimeoutMs?: number
+  /** Max wait before a burst of live inserts resolves its quoted parents in one batch; default 250. */
+  replyPreviewWindowMs?: number
+  /** How long a jumped-to row stays highlighted; default 2000. */
+  highlightDurationMs?: number
   onBack?: () => void
   onAddAttachment?: () => void
   onConversationLoaded?: (conversation: Conversation) => void
@@ -80,6 +86,8 @@ export function ConvoKitConversation(props: ConvoKitConversationProps): ReactEle
       ...(props.markReadOnLoad === undefined ? {} : { markReadOnLoad: props.markReadOnLoad }),
       ...(props.markReadOnReceive === undefined ? {} : { markReadOnReceive: props.markReadOnReceive }),
       ...(props.typingTimeoutMs ? { typingTimeoutMs: props.typingTimeoutMs } : {}),
+      ...(props.replyPreviewWindowMs === undefined ? {} : { replyPreviewWindowMs: props.replyPreviewWindowMs }),
+      ...(props.highlightDurationMs === undefined ? {} : { highlightDurationMs: props.highlightDurationMs }),
     })
   }
   const controller = props.controller ?? owned.current!
@@ -108,6 +116,17 @@ export function ConvoKitConversation(props: ConvoKitConversationProps): ReactEle
     onSendMessage={async ({ text }) => Boolean(await controller.sendMessage({ text }))}
     onTypingChanged={typing => { void controller.updateTyping(typing) }}
     editingMessage={state.editingMessage}
+    replyTarget={state.replyTarget}
+    replyPreviewByMessageId={state.replyPreviews}
+    highlightedMessageId={state.highlightedMessageId}
+    hasNewerMessages={state.hasNewerMessages}
+    isLoadingNewer={state.isLoadingNewer}
+    onReplyToMessage={(message: Message) => controller.startReply(message.id)}
+    onCancelReply={() => controller.cancelReply()}
+    onLoadNewer={() => controller.loadNewerMessages()}
+    onHighlightDismissed={() => controller.clearHighlight()}
+    {...(state.canJumpToMessages ? { onJumpToMessage: (messageId: string) => { void controller.jumpToMessage(messageId) } } : {})}
+    {...(state.windowMode === 'jumped' ? { onReturnToLatest: () => { void controller.returnToLatest() } } : {})}
     {...(state.canEditMessages ? {
       onEditMessage: (message: Message) => controller.startEditing(message.id),
       onSaveEdit: (_: Message, text: string) => controller.saveEdit(text),
