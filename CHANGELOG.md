@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.8.1
+
+Parity patch against `@convokitapp/react-ui` 0.8.0 for the read-position, inbox
+preview, mark-unread and message-edit behaviours. No adapter change; the peer
+stays `@convokitapp/react-native` `>=0.8.0 <0.9.0`.
+
+- Fixed: room controllers (`ConversationController`, `useConvoKitConversation`,
+  `ConvoKitConversation`) subscribe to `onInboxChanged` while attached and
+  reconcile the room on every signal, exactly as on a rejoin (a title or
+  membership change, or a deletion whose `message_deleted` was missed, no
+  longer waits for a foreground return). Both signals (the rejoin and
+  `inbox_changed`) now queue one refresh behind an in-flight initial load,
+  reconcile or history page and run it afterwards, instead of being dropped
+  during a reconcile or restarting the initial load; so the SDK's synchronous
+  join replay of `inbox_changed` on an app hub the list already holds runs as
+  one refresh after the load that bound it, and a burst coalesces. The
+  subscription is released with the room's other subscriptions on dispose and
+  on the next `loadInitial()`. The README sentence "Room controllers keep
+  subscribing to `onInboxChanged` only" is now true.
+- Fixed: `refresh()` tombstones every confirmed row it knew when the reconcile
+  was requested that the refetched range no longer carries, like a
+  `message_deleted`, so a deletion missed while offline cannot be resurrected
+  by a late edit or send response, a hydration or a row image (they are
+  dropped as for any deletion), and the read acknowledgement re-targets. The
+  reconciled window is the rendered rows up to the server's page cap of 100
+  (the request is capped there; a larger `limit` was clamped silently, and a
+  page short of it read as "nothing older exists"). A full page reconciles
+  from its oldest row on: rows older than that window are dropped from view as
+  before, never tombstoned, and `hasOlderMessages` turns true so the next
+  `loadOlderMessages()` brings them back even from an exhausted history.
+  Tombstones keep their lifetime (cleared by the next `loadInitial()`).
+- Changed: `ConversationListController.markUnread` / `clearUnread` refuse to
+  send once the controller is not active (disposed, retired after the session
+  ended, bound to a session the shared client has since replaced, or never
+  loaded): they reject with `ConversationListController is not active` before
+  any request, without touching `error`, so a private marker is never written
+  under another user's login. The session is compared on the legacy path too
+  (a custom `pageLoader`), where reads run without one. Previously the request
+  went out and only the late response was dropped.
+- Changed: a failed `markUnread` / `clearUnread` request now sets `error`,
+  keeps the row and rejects (re-throws the adapter error) instead of resolving
+  `undefined` / `false`; hosts must catch. `clearUnread` resolves `false` only
+  for a `cleared: false` answer. A request that was sent before the session
+  changed hands still rejects but reports nothing into the next user's
+  snapshot.
+- Fixed: the deletion of the in-flight or last acknowledged read target
+  re-issues an acknowledgement only where `markReadOnReceive` is enabled; with
+  `markReadOnReceive: false` no acknowledgement is sent because a deletion
+  arrived (an explicit `markRead()` still acknowledges the newest rendered
+  row). Default options re-target as before.
+- Fixed: the default composer hides the `Add attachment` control while
+  `editingMessage` is set (author edits change text only); it returns when
+  edit mode ends.
+- Changed: the `remove()` handed to custom `renderMessage` rows asks
+  `confirmDelete` only when the host provided one and otherwise calls
+  `onDeleteMessage` at once; confirmation UI is the custom row's own. The
+  default row keeps the built-in `Delete this message?` dialog when no
+  `confirmDelete` is set, and `confirmDelete` still replaces it. Previously a
+  custom row's `remove()` always opened the built-in dialog first.
+- Added: `src/index.ts` re-exports (type-only) the core types the UI surface
+  is typed against, so custom adapters and controller callers can import them
+  from this package alone: `ClearConversationUnreadOptions`,
+  `ClearUnreadResult`, `ConversationMembership`, `ConversationPrivateState`,
+  `EditMessageInput`, `InboxEntry`, `InboxSummary`, `Message`, `ReadPosition`.
+- Docs: README gains "Controlled components" and "Customization" sections
+  with worked samples for the controlled views and render callbacks
+  (`readPositionByUserId` / `readAtByUserId` / `setVisible`, `summaries` /
+  `currentUserId` / `renderItem` with `unreadBadge` and `markUnread`,
+  `editingMessage` and the edit callbacks with `confirmDelete`,
+  `renderMessage` with `isEdited` / `edit` / `remove`, `renderComposer` with
+  `editing` / `cancelEdit`), and states the rules above.
+
 ## 0.8.0
 
 - Edit and delete your own messages. `ConversationController` (and so
