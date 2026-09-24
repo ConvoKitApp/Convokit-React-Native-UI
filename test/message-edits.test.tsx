@@ -86,6 +86,21 @@ const callbacks = () => ({ onEditMessage: vi.fn(), onDeleteMessage: vi.fn(() => 
 beforeEach(() => { pressed.length = 0; inputs.length = 0; vi.mocked(Alert.alert).mockReset() })
 
 describe('default row actions', () => {
+  it('renders selected reaction chips and exposes toggle and reactor actions', async () => {
+    const toggle = vi.fn(async () => true)
+    const listUsers = vi.fn(async () => ({ data: [], nextCursor: null }))
+    const html = list({
+      messages: [theirs], reactionEmojis: ['👍🏽', '🎉'],
+      reactionSummaries: new Map([[theirs.id, { messageId: theirs.id, reactions: [{ emoji: '👍🏽', count: 2, reactedByMe: true }], hasMore: false }]]),
+      onToggleReaction: toggle, onListReactionUsers: listUsers,
+    })
+    expect(html).toContain('👍🏽 2')
+    expect(html).toContain('Add reaction')
+    expect(html).toContain('View users who reacted with 👍🏽')
+    ;(button('👍🏽 2 reactions; remove mine').onPress as () => void)()
+    await flush()
+    expect(toggle).toHaveBeenCalledWith(theirs, '👍🏽')
+  })
   it('renders ineligible rows byte-identically with and without the callbacks', () => {
     const readOnly = { ...conversation, membership: { role: 'READ', lastReadAt: null, readPosition: null, unreadMarkedAt: null, privateStateVersion: 0 } }
     const listed = { ...conversation, participants: [participant('me', 'Maya', 'READ'), participant('alex', 'Alex')] }

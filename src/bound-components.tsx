@@ -57,6 +57,7 @@ export interface ConvoKitConversationProps extends Omit<MessageListViewProps,
   'conversation' | 'messages' | 'currentUserId' | 'readAtByUserId' | 'readPositionByUserId' | 'onLoadOlder' |
   'hasOlderMessages' | 'isLoadingOlder' | 'error' | 'onEditMessage' | 'onDeleteMessage' |
   'onReplyToMessage' | 'replyPreviewByMessageId' | 'onJumpToMessage' | 'highlightedMessageId' |
+  'reactionSummaries' | 'onToggleReaction' | 'onListReactionUsers' |
   'hasNewerMessages' | 'isLoadingNewer' | 'onLoadNewer' | 'onHighlightDismissed'> {
   conversationId: string
   sdk?: ConvoKitClient
@@ -118,6 +119,11 @@ export function ConvoKitConversation(props: ConvoKitConversationProps): ReactEle
     editingMessage={state.editingMessage}
     replyTarget={state.replyTarget}
     replyPreviewByMessageId={state.replyPreviews}
+    {...(state.canReact ? {
+      reactionSummaries: state.reactionSummaries,
+      onToggleReaction: (message: Message, emoji: string) => controller.toggleReaction(message.id, emoji),
+      onListReactionUsers: (message: Message, emoji: string, cursor?: string) => controller.listReactionUsers(message.id, emoji, cursor),
+    } : {})}
     highlightedMessageId={state.highlightedMessageId}
     hasNewerMessages={state.hasNewerMessages}
     isLoadingNewer={state.isLoadingNewer}

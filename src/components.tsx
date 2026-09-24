@@ -3,7 +3,7 @@ import {
   AccessibilityInfo, ActivityIndicator, Alert, FlatList, Image, Pressable, StyleSheet, Text, TextInput, View,
   type AlertButton,
 } from 'react-native'
-import type { Conversation, InboxSummary, Message, MessageMedia, Participant, ReadPosition } from '@convokitapp/react-native'
+import type { Conversation, InboxSummary, Message, MessageMedia, MessageReactionSummary, Participant, ReactionUsersPage, ReadPosition } from '@convokitapp/react-native'
 import { ComposerDraft } from './composer-draft'
 import { isConvoKitPendingMessage, resolveReaderIds, type ReplyPreviewEntry } from './conversation-controller'
 import { useControllerState } from './hooks'
@@ -62,6 +62,12 @@ export interface MessageRowContext {
    * show the quoted message, loading it when it is outside the window.
    */
   jumpToReplyTarget?: () => void
+  reaction?: {
+    summary: MessageReactionSummary | undefined
+    canToggle: boolean
+    toggle: (emoji: string) => Promise<boolean>
+    listUsers: (emoji: string, cursor?: string) => Promise<ReactionUsersPage>
+  }
 }
 export interface MediaContext { media: MessageMedia; message: Message; isCurrentUser: boolean }
 
@@ -200,6 +206,10 @@ export interface MessageListViewProps {
    * rendered but not activatable and no jump affordance appears.
    */
   onJumpToMessage?: (messageId: string) => void
+  reactionSummaries?: ReadonlyMap<string, MessageReactionSummary>
+  onToggleReaction?: (message: Message, emoji: string) => Promise<boolean>
+  onListReactionUsers?: (message: Message, emoji: string, cursor?: string) => Promise<ReactionUsersPage>
+  reactionEmojis?: readonly string[]
   /** 0.9: the row a jump landed on; it is tinted with `colors.highlight` until the host clears it. */
   highlightedMessageId?: string | null
   /** 0.9: whether rows newer than the rendered window exist; drives the newer-edge pagination trigger,
@@ -340,6 +350,12 @@ export function ConvoKitMessageListView(props: MessageListViewProps): ReactEleme
       const canReply = Boolean(props.onReplyToMessage) && replyable(item)
       const parentId = item.replyToMessageId
       const preview = parentId === undefined ? undefined : props.replyPreviewByMessageId?.get(parentId)
+      const reaction = props.reactionSummaries && props.onListReactionUsers && !isConvoKitPendingMessage(item) ? {
+        summary: props.reactionSummaries.get(item.id),
+        canToggle: role !== 'READ' && !!props.onToggleReaction,
+        toggle: (emoji: string) => props.onToggleReaction?.(item, emoji) ?? Promise.resolve(false),
+        listUsers: (emoji: string, cursor?: string) => props.onListReactionUsers!(item, emoji, cursor),
+      } : undefined
       const context: MessageRowContext = {
         message: item, chronologicalIndex: index, isCurrentUser: mine,
         ...(participants.get(item.senderId) ? { sender: participants.get(item.senderId)! } : {}), readerIds,
@@ -351,10 +367,12 @@ export function ConvoKitMessageListView(props: MessageListViewProps): ReactEleme
         ...(preview === undefined ? {} : { replyPreview: preview }),
         ...(parentId !== undefined && props.onJumpToMessage
           ? { jumpToReplyTarget: () => props.onJumpToMessage?.(parentId) } : {}),
+        ...(reaction ? { reaction } : {}),
       }
       return <>{props.renderMessage?.(context) ?? <DefaultMessageRow
         {...context} renderMedia={props.renderMedia} renderReadReceipt={props.renderReadReceipt}
         onAttachmentPress={props.onAttachmentPress} inlineConfirm={!props.confirmDelete}
+        reactionEmojis={props.reactionEmojis ?? ['👍', '❤️', '😂', '🎉', '😮', '😢']}
         isHighlighted={highlightedId === item.id}
         senderName={(id: string) => participants.get(id)?.name ?? id}
       />}</>
@@ -548,9 +566,76 @@ function QuotedMessage(props: {
   return <Pressable accessibilityRole="button" accessibilityLabel={label} onPress={props.onPress}>{quote}</Pressable>
 }
 
+export function ReactionBar(props: { reaction: NonNullable<MessageRowContext['reaction']>; emojis?: readonly string[] }): ReactElement {
+  const theme = useConvoKitTheme()
+  const [picker, setPicker] = useState(false)
+  const [viewing, setViewing] = useState<string | null>(null)
+  const [users, setUsers] = useState<ReactionUsersPage['data']>([])
+  const [cursor, setCursor] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const serial = useRef(0)
+  useEffect(() => () => { serial.current++ }, [])
+  const toggle = async (emoji: string) => {
+    setBusy(true); setError(null)
+    try {
+      if (await props.reaction.toggle(emoji)) setPicker(false)
+      else setError('Could not update reaction')
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)) }
+    finally { setBusy(false) }
+  }
+  const loadUsers = async (emoji: string, next?: string) => {
+    const request = ++serial.current
+    setViewing(emoji); setBusy(true); setError(null)
+    if (!next) { setUsers([]); setCursor(null) }
+    try {
+      const page = await props.reaction.listUsers(emoji, next)
+      if (request !== serial.current) return
+      setUsers(previous => next ? [...previous, ...page.data] : page.data)
+      setCursor(page.nextCursor)
+    } catch (cause) { if (request === serial.current) setError(cause instanceof Error ? cause.message : String(cause)) }
+    finally { if (request === serial.current) setBusy(false) }
+  }
+  return <View accessibilityLabel="Message reactions" style={styles.reactions}>
+    <View style={styles.reactionChips} accessibilityLiveRegion="polite">
+      {props.reaction.summary?.reactions.map(row => <View key={row.emoji} style={[styles.reactionItem, { borderColor: theme.colors.border, backgroundColor: theme.colors.surface }]}>
+        {props.reaction.canToggle ? <Pressable accessibilityRole="button" accessibilityLabel={`${row.emoji} ${row.count} reactions; ${row.reactedByMe ? 'remove mine' : 'add mine'}`}
+          accessibilityState={{ selected: row.reactedByMe, disabled: busy }} disabled={busy} onPress={() => { void toggle(row.emoji) }} style={styles.reactionChip}>
+          <Text style={{ color: theme.colors.text }}>{row.emoji} {row.count}</Text>
+        </Pressable> : <Text style={[styles.reactionChip, { color: theme.colors.text }]}>{row.emoji} {row.count}</Text>}
+        <Pressable accessibilityRole="button" accessibilityLabel={`View users who reacted with ${row.emoji}`}
+          onPress={() => { void loadUsers(row.emoji) }} style={styles.reactionPeople}>
+          <Text style={{ color: theme.colors.mutedText, fontSize: theme.typography.caption }}>People</Text>
+        </Pressable>
+      </View>)}
+      {props.reaction.summary?.hasMore && <Text style={{ color: theme.colors.mutedText }}>More reactions</Text>}
+      {props.reaction.canToggle && <Pressable accessibilityRole="button" accessibilityLabel="Add reaction" accessibilityState={{ expanded: picker }}
+        onPress={() => setPicker(value => !value)} style={[styles.reactionAdd, { borderColor: theme.colors.border }]}>
+        <Text style={{ color: theme.colors.primary }}>＋</Text>
+      </Pressable>}
+    </View>
+      {picker && props.reaction.canToggle && <View accessibilityLabel="Choose a reaction" style={styles.reactionChips}>
+        {(props.emojis ?? ['👍', '❤️', '😂', '🎉', '😮', '😢']).map(emoji => <Pressable key={emoji} accessibilityRole="button" accessibilityLabel={`React with ${emoji}`}
+        disabled={busy} onPress={() => { void toggle(emoji) }} style={styles.reactionChoice}>
+        <Text style={{ fontSize: 20 }}>{emoji}</Text>
+      </Pressable>)}
+    </View>}
+    {viewing && <View accessibilityLabel={`Users who reacted with ${viewing}`} style={[styles.reactionUsers, { borderColor: theme.colors.border, backgroundColor: theme.colors.surface }]}>
+      <Pressable accessibilityRole="button" accessibilityLabel="Close reaction users" onPress={() => { serial.current++; setViewing(null) }}>
+        <Text style={{ color: theme.colors.primary }}>Close</Text>
+      </Pressable>
+      {users.map(user => <Text key={user.userId} style={{ color: theme.colors.text }}>{user.name || user.userId}</Text>)}
+      {!busy && users.length === 0 && !error && <Text style={{ color: theme.colors.mutedText }}>No reactions</Text>}
+      {cursor && <Pressable accessibilityRole="button" accessibilityLabel="Load more reaction users" disabled={busy}
+        onPress={() => { void loadUsers(viewing, cursor) }}><Text style={{ color: theme.colors.primary }}>Load more</Text></Pressable>}
+    </View>}
+    {error && <Text accessibilityRole="alert" style={{ color: theme.colors.error }}>{error}</Text>}
+  </View>
+}
+
 /** `inlineConfirm`: the view has no `confirmDelete`, so the row asks with the built-in dialog before `remove()`. */
 function DefaultMessageRow(props: MessageRowContext & Pick<MessageListViewProps, 'renderMedia' | 'renderReadReceipt' | 'onAttachmentPress'> & {
-  inlineConfirm: boolean; isHighlighted?: boolean; senderName?: (id: string) => string
+  inlineConfirm: boolean; isHighlighted?: boolean; senderName?: (id: string) => string; reactionEmojis: readonly string[]
 }): ReactElement {
   const theme = useConvoKitTheme(); const pending = isConvoKitPendingMessage(props.message)
   const timeColor = props.isCurrentUser ? theme.colors.outgoingText : theme.colors.mutedText
@@ -582,6 +667,7 @@ function DefaultMessageRow(props: MessageRowContext & Pick<MessageListViewProps,
           {pending ? 'Sending…' : formatMessageTime(props.message.createdAt)}
         </Text>}
     </View>
+    {props.reaction && <ReactionBar reaction={props.reaction} emojis={props.reactionEmojis} />}
     {props.isCurrentUser && !pending && props.readerIds.size > 0 && <>{props.renderReadReceipt?.(props.message, props.readerIds) ??
       <Text style={{ color: theme.colors.mutedText, fontSize: theme.typography.caption }}>Read by {props.readerIds.size}</Text>}</>}
   </>
@@ -648,6 +734,14 @@ function ErrorState({ error, retry }: { error: unknown; retry?: AsyncAction }): 
 }
 
 const styles = StyleSheet.create({
+  reactions: { marginTop: 4, maxWidth: 520, gap: 4 },
+  reactionChips: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 4 },
+  reactionItem: { flexDirection: 'row', alignItems: 'center', borderWidth: StyleSheet.hairlineWidth, borderRadius: 20 },
+  reactionChip: { paddingVertical: 4, paddingLeft: 9, paddingRight: 5 },
+  reactionPeople: { paddingVertical: 4, paddingLeft: 3, paddingRight: 9 },
+  reactionAdd: { minWidth: 28, minHeight: 28, borderWidth: StyleSheet.hairlineWidth, borderRadius: 16, alignItems: 'center', justifyContent: 'center' },
+  reactionChoice: { padding: 5 },
+  reactionUsers: { padding: 8, borderWidth: StyleSheet.hairlineWidth, borderRadius: 8, gap: 5 },
   flex: { flex: 1 }, center: { flex: 1, textAlign: 'center', textAlignVertical: 'center' },
   row: { minHeight: 68, borderWidth: StyleSheet.hairlineWidth, borderRadius: 14, padding: 12, flexDirection: 'row', alignItems: 'center', gap: 12 },
   avatar: { width: 42, height: 42, borderRadius: 21 }, avatarFallback: { alignItems: 'center', justifyContent: 'center' },

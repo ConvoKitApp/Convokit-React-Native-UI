@@ -7,6 +7,8 @@ import {
   type MessageContextPage,
   type MessageEvent,
   type MessageMedia,
+  type MessageReactionSummary,
+  type ReactionUsersPage,
   type ReadPosition,
   type RealtimeSubscription,
   type ReplyPreview,
@@ -88,6 +90,8 @@ export interface ConversationState {
    * its uncoded 404. Quoted blocks then render the reference without its text.
    */
   canResolveReplyPreviews: boolean
+  reactionSummaries: ReadonlyMap<string, MessageReactionSummary>
+  canReact: boolean
 }
 
 export interface ConversationControllerOptions {
@@ -262,6 +266,12 @@ export class ConversationController extends ObservableStore<ConversationState> {
   private windowRefreshQueued = false
   private supportsJump: boolean
   private supportsReplyPreviews: boolean
+  private readonly supportsReactions: boolean
+  private reactions = new Map<string, MessageReactionSummary>()
+  private reactionDirty = new Set<string>()
+  private reactionEpoch = new Map<string, number>()
+  private reactionTimer?: ReturnType<typeof setTimeout>
+  private loadingReactions = false
 
   constructor(private options: ConversationControllerOptions) {
     super()
@@ -275,6 +285,9 @@ export class ConversationController extends ObservableStore<ConversationState> {
     this.supportsDelete = typeof options.client.deleteMessage === 'function'
     this.supportsJump = typeof options.client.getMessageContext === 'function'
     this.supportsReplyPreviews = typeof options.client.getReplyPreviews === 'function'
+    this.supportsReactions = typeof options.client.getReactionSummaries === 'function'
+      && typeof options.client.addReaction === 'function' && typeof options.client.removeReaction === 'function'
+      && typeof options.client.listReactionUsers === 'function'
     if (options.autoLoad !== false) void this.loadInitial()
   }
 
@@ -303,7 +316,80 @@ export class ConversationController extends ObservableStore<ConversationState> {
     isLoadingNewer: this.loadingNewer,
     canJumpToMessages: this.supportsJump,
     canResolveReplyPreviews: this.supportsReplyPreviews,
+    reactionSummaries: new Map(this.reactions), canReact: this.supportsReactions,
   })
+
+  protected override emit(): void {
+    if (this.supportsReactions && this.current(this.generation)) {
+      const visible = new Set([...this.messages.values()].filter(row => !isConvoKitPendingMessage(row)).map(row => row.id))
+      for (const id of this.reactions.keys()) if (!visible.has(id)) this.reactions.delete(id)
+      this.queueReactionRefresh([...visible].filter(id => !this.reactions.has(id)))
+    }
+    super.emit()
+  }
+
+  private queueReactionRefresh(ids: readonly string[]): void {
+    if (!this.supportsReactions || !this.current(this.generation)) return
+    for (const id of ids) if (this.messages.has(id) && !isConvoKitPendingMessage(this.messages.get(id)!)) {
+      this.reactionDirty.add(id)
+      this.reactionEpoch.set(id, (this.reactionEpoch.get(id) ?? 0) + 1)
+    }
+    this.scheduleReactionRefresh()
+  }
+  private scheduleReactionRefresh(): void {
+    if (!this.reactionDirty.size || this.reactionTimer || !this.current(this.generation)) return
+    this.reactionTimer = setTimeout(() => { this.reactionTimer = undefined; void this.flushReactionRefresh() }, 25)
+  }
+  private async flushReactionRefresh(): Promise<void> {
+    const fetch = this.options.client.getReactionSummaries
+    if (!this.current(this.generation) || !fetch || this.loadingReactions || !this.reactionDirty.size) return
+    const generation = this.generation
+    const ids = [...this.reactionDirty]
+    const epochs = new Map(ids.map(id => [id, this.reactionEpoch.get(id)]))
+    this.reactionDirty.clear(); this.loadingReactions = true
+    try {
+      const rows = await fetch.call(this.options.client, this.conversationId, ids)
+      if (!this.current(generation)) return
+      const byId = new Map(rows.map(row => [row.messageId, row]))
+      for (const id of ids) {
+        if (!this.messages.has(id) || epochs.get(id) !== this.reactionEpoch.get(id)) continue
+        this.reactions.set(id, byId.get(id) ?? { messageId: id, reactions: [], hasMore: false })
+      }
+      this.emit()
+    } catch (cause) {
+      if (this.current(generation)) {
+        // Keep an empty snapshot until an explicit invalidation or reconnect;
+        // an error must not make emit() retry the endpoint in a tight loop.
+        for (const id of ids) if (this.messages.has(id)) this.reactions.set(id, { messageId: id, reactions: [], hasMore: false })
+        this.error = cause; this.emit()
+      }
+    }
+    finally { if (generation === this.generation) { this.loadingReactions = false; this.scheduleReactionRefresh() } }
+  }
+
+  async toggleReaction(messageId: string, emoji: string): Promise<boolean> {
+    if (!this.current(this.generation) || !this.supportsReactions || this.role() === 'READ'
+      || !this.messages.has(messageId) || isConvoKitPendingMessage(this.messages.get(messageId)!)) return false
+    const selected = this.reactions.get(messageId)?.reactions.some(row => row.emoji === emoji && row.reactedByMe) ?? false
+    const generation = this.generation
+    try {
+      const mutate = selected ? this.options.client.removeReaction! : this.options.client.addReaction!
+      await mutate.call(this.options.client, messageId, emoji)
+      if (!this.current(generation)) return false
+      this.queueReactionRefresh([messageId]); return true
+    } catch (cause) {
+      if (this.current(generation)) { this.error = cause; this.emit(); this.queueReactionRefresh([messageId]) }
+      return false
+    }
+  }
+
+  async listReactionUsers(messageId: string, emoji: string, cursor?: string): Promise<ReactionUsersPage> {
+    if (!this.current(this.generation) || !this.options.client.listReactionUsers) throw new Error('Reactions are unavailable')
+    const generation = this.generation
+    const page = await this.options.client.listReactionUsers(messageId, emoji, { ...(cursor ? { cursor } : {}), limit: 30 })
+    if (!this.current(generation)) throw new Error('Session changed while loading reactions')
+    return page
+  }
 
   readerIdsFor(message: Message): ReadonlySet<string> {
     return resolveReaderIds(message, this.positions, this.reads)
@@ -314,6 +400,7 @@ export class ConversationController extends ObservableStore<ConversationState> {
     const generation = ++this.generation
     await this.clearSubscriptions()
     this.messages.clear(); this.deleted.clear(); this.typing.clear(); this.reads.clear(); this.positions.clear()
+    this.clearReactions()
     this.resetAcknowledgements(); this.editing = null; this.saving = null; this.refreshQueued = false
     this.resetWindow()
     this.conversation = null; this.error = null; this.hasOlder = true; this.initialLoading = true; this.emit()
@@ -778,18 +865,26 @@ export class ConversationController extends ObservableStore<ConversationState> {
     this.disposed = true; ++this.generation
     clearTimeout(this.localTypingTimer); clearTimeout(this.localTypingRenewal)
     this.clearPreviewTimer(); this.clearHighlightTimer()
+    this.clearReactions()
     for (const timer of this.remoteTypingTimers.values()) clearTimeout(timer)
     void this.options.client.sendTyping({ conversationId: this.conversationId, isTyping: false }).catch(() => undefined)
     await this.clearSubscriptions(); this.listeners.clear()
   }
 
   private get typingTimeout(): number { return this.options.typingTimeoutMs ?? 3000 }
+  private clearReactions(): void {
+    clearTimeout(this.reactionTimer); this.reactionTimer = undefined
+    this.reactionDirty.clear(); this.reactionEpoch.clear(); this.reactions.clear(); this.loadingReactions = false
+  }
   private bind(generation: number): void {
     const client = this.options.client
     this.subscriptions.add(client.onMessage(this.conversationId, event => { void this.receive(event.message, event.type, generation) }))
     this.subscriptions.add(client.onMessageDeleted(this.conversationId, event => {
       if (!this.current(generation) || event.conversationId !== this.conversationId) return
       this.remove(event.id); this.emit()
+    }))
+    if (client.onReactionChanged) this.subscriptions.add(client.onReactionChanged(this.conversationId, event => {
+      if (this.current(generation) && event.conversationId === this.conversationId) this.queueReactionRefresh([event.id])
     }))
     this.subscriptions.add(client.onReadReceipt(this.conversationId, event => {
       if (!this.current(generation)) return
@@ -813,6 +908,7 @@ export class ConversationController extends ObservableStore<ConversationState> {
         // A rejoin may have missed a parent's edit, which no row-precedence rule can see from a reply
         // row: every non-terminal preview is re-read on the next batch.
         this.markPreviewsStale()
+        this.queueReactionRefresh([...this.messages.keys()])
         this.queueRefresh()
       }
     }, () => this.retire(generation)))
@@ -1343,6 +1439,7 @@ export class ConversationController extends ObservableStore<ConversationState> {
     if (this.disposed || generation !== this.generation) return
     ++this.generation; this.messages.clear(); this.conversation = null; this.typing.clear(); this.reads.clear(); this.positions.clear()
     this.resetAcknowledgements(); this.editing = null; this.saving = null; this.refreshQueued = false
+    this.clearReactions()
     this.resetWindow()
     this.error = new Error('ConvoKit session ended'); this.emit()
   }
