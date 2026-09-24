@@ -17,6 +17,7 @@ export {
   ConvoKitConversationListView,
   ConvoKitConversationView,
   ConvoKitMessageListView,
+  ReactionBar,
 } from './components'
 export type {
   ComposerContext, ConversationListViewProps, ConversationRowContext, ConversationViewProps, MediaContext,
@@ -28,5 +29,6 @@ export type { ConvoKitConversationListProps, ConvoKitConversationProps } from '.
 // them from this package alone (type-only: nothing is loaded from the peer at runtime).
 export type {
   ClearConversationUnreadOptions, ClearUnreadResult, ConversationMembership, ConversationPrivateState, EditMessageInput,
-  InboxEntry, InboxSummary, Message, MessageContextOptions, MessageContextPage, ReadPosition, ReplyPreview,
+  InboxEntry, InboxSummary, Message, MessageContextOptions, MessageContextPage, MessageReactionSummary,
+  ReactionSummary, ReactionUser, ReactionUsersPage, ReadPosition, ReplyPreview,
 } from '@convokitapp/react-native'

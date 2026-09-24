@@ -1,6 +1,7 @@
 import type {
   ClearConversationUnreadOptions, ClearUnreadResult, ConversationPrivateState, ConvoKitClient, Conversation, InboxPage,
   MarkConversationReadOptions, Message, MessageContextPage, MessageDeletedEvent, MessageEvent, MessageMedia, ReadEvent,
+  MessageReactionSummary, ReactionChangedEvent, ReactionMutationResult, ReactionUsersOptions, ReactionUsersPage,
   RealtimeConnectionEvent, RealtimeSubscription, ReplyPreview, TypingEvent,
 } from '@convokitapp/react-native'
 
@@ -67,6 +68,10 @@ export interface ConvoKitUiClient {
    * every quoted block without its text.
    */
   getReplyPreviews?(conversationId: string, messageIds: string[]): Promise<ReplyPreview[]>
+  addReaction?(messageId: string, emoji: string): Promise<ReactionMutationResult>
+  removeReaction?(messageId: string, emoji: string): Promise<ReactionMutationResult>
+  getReactionSummaries?(conversationId: string, messageIds: string[]): Promise<MessageReactionSummary[]>
+  listReactionUsers?(messageId: string, emoji: string, options?: ReactionUsersOptions): Promise<ReactionUsersPage>
   /** The 0.9 context window: one page of a room's history centred on `messageId`, or continued from a
    * previous window's `olderCursor` / `newerCursor`. Exactly one of the three selectors is sent. An
    * unknown, deleted or out-of-room `messageId` must reject with `code` `MESSAGE_NOT_FOUND`. Optional so
@@ -81,6 +86,7 @@ export interface ConvoKitUiClient {
   onInboxChanged(handler: () => void): RealtimeSubscription
   onMessage(id: string, handler: (event: MessageEvent) => void): RealtimeSubscription
   onMessageDeleted(id: string, handler: (event: MessageDeletedEvent) => void): RealtimeSubscription
+  onReactionChanged?(id: string, handler: (event: ReactionChangedEvent) => void): RealtimeSubscription
   onReadReceipt(id: string, handler: (event: ReadEvent) => void): RealtimeSubscription
   onTyping(id: string, handler: (event: TypingEvent) => void): RealtimeSubscription
 }
@@ -111,6 +117,12 @@ export class DefaultConvoKitUiClient implements ConvoKitUiClient {
   getReplyPreviews(conversationId: string, messageIds: string[]) {
     return this.sdk.getReplyPreviews(conversationId, messageIds)
   }
+  addReaction(messageId: string, emoji: string) { return this.sdk.addReaction(messageId, emoji) }
+  removeReaction(messageId: string, emoji: string) { return this.sdk.removeReaction(messageId, emoji) }
+  getReactionSummaries(conversationId: string, messageIds: string[]) { return this.sdk.getReactionSummaries(conversationId, messageIds) }
+  listReactionUsers(messageId: string, emoji: string, options?: ReactionUsersOptions) {
+    return this.sdk.listReactionUsers(messageId, emoji, options)
+  }
   getMessageContext(conversationId: string, options: Parameters<ConvoKitClient['getMessageContext']>[1]) {
     return this.sdk.getMessageContext(conversationId, options)
   }
@@ -123,6 +135,9 @@ export class DefaultConvoKitUiClient implements ConvoKitUiClient {
   onMessage(id: string, handler: (event: MessageEvent) => void) { return this.sdk.realtime.onMessage(id, handler) }
   onMessageDeleted(id: string, handler: (event: MessageDeletedEvent) => void) {
     return this.sdk.realtime.onMessageDeleted(id, handler)
+  }
+  onReactionChanged(id: string, handler: (event: ReactionChangedEvent) => void) {
+    return this.sdk.realtime.onReactionChanged(id, handler)
   }
   onReadReceipt(id: string, handler: (event: ReadEvent) => void) {
     return this.sdk.realtime.onReadReceipt(id, handler)

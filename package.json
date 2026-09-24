@@ -1,6 +1,6 @@
 {
   "name": "@convokitapp/react-native-ui",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Extensible React Native conversation UI for ConvoKit.",
   "repository": {
     "type": "git",
@@ -30,16 +30,23 @@
       }
     }
   },
-  "files": ["src", "lib", "README.md", "CHANGELOG.md"],
-  "engines": { "node": ">=22.13.0" },
+  "files": [
+    "src",
+    "lib",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "peerDependencies": {
-    "@convokitapp/react-native": ">=0.9.0 <0.10.0",
+    "@convokitapp/react-native": ">=1.1.0 <2.0.0",
     "react": ">=19.2.0",
     "react-native": ">=0.86.0 <0.88.0"
   },
   "devDependencies": {
-    "@convokitapp/react-native": "0.9.0",
-    "@convokitapp/sdk": "0.9.0",
+    "@convokitapp/react-native": "1.1.0",
+    "@convokitapp/sdk": "1.1.0",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "react": "^19.2.0",
@@ -61,6 +68,25 @@
   "react-native-builder-bob": {
     "source": "src",
     "output": "lib",
-    "targets": [["commonjs", {"esm": true}], ["module", {"esm": true}], ["typescript", {"project": "tsconfig.build.json"}]]
+    "targets": [
+      [
+        "commonjs",
+        {
+          "esm": true
+        }
+      ],
+      [
+        "module",
+        {
+          "esm": true
+        }
+      ],
+      [
+        "typescript",
+        {
+          "project": "tsconfig.build.json"
+        }
+      ]
+    ]
   }
 }

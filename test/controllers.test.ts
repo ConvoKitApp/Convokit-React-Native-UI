@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   ClearConversationUnreadOptions, ClearUnreadResult, Conversation, ConversationMembership, ConversationPrivateState,
   InboxEntry, InboxPage, InboxSummary, Message, MessageDeletedEvent, MessageEvent, Participant, ReadEvent, ReadPosition,
-  RealtimeSubscription,
+  ReactionChangedEvent, RealtimeSubscription,
 } from '@convokitapp/react-native'
 import { ConversationController } from '../src/conversation-controller'
 import { ConversationListController } from '../src/conversation-list-controller'
@@ -50,14 +50,16 @@ const missing = () => Object.assign(new Error('Message not found'), { status: 40
  * the optional mark/clear members; `edits: false` a 0.7 adapter without the author edit/delete members. The
  * 0.8 members act on `rows` like the backend: a stale revision is a 409, an unknown id a coded 404.
  */
-function client(rows: Message[] = [], participants: Participant[] = [], options: { membership?: ConversationMembership; unread?: boolean; edits?: boolean } = {}) {
+function client(rows: Message[] = [], participants: Participant[] = [], options: { membership?: ConversationMembership; unread?: boolean; edits?: boolean; reactions?: boolean } = {}) {
   const session = {}
   const handlers: {
     message?: (event: MessageEvent) => void
     deleted?: (event: MessageDeletedEvent) => void
     read?: (event: ReadEvent) => void
     inboxChanged?: () => void
+    reaction?: (event: ReactionChangedEvent) => void
   } = {}
+  const reactions = new Map<string, Set<string>>()
   const sdk: ConvoKitUiClient = {
     currentUserId: 'me', sessionIdentity: session,
     getConversations: vi.fn().mockResolvedValue([conversation]),
@@ -96,6 +98,18 @@ function client(rows: Message[] = [], participants: Participant[] = [], options:
         rows.splice(index, 1)
       }),
     }),
+    ...(options.reactions ? {
+      getReactionSummaries: vi.fn(async (_room: string, ids: string[]) => ids.map(messageId => ({
+        messageId, reactions: [...(reactions.get(messageId) ?? [])].map(emoji => ({ emoji, count: 1, reactedByMe: true })), hasMore: false,
+      }))),
+      addReaction: vi.fn(async (messageId: string, emoji: string) => {
+        const set = reactions.get(messageId) ?? new Set<string>(); const changed = !set.has(emoji)
+        set.add(emoji); reactions.set(messageId, set); return { messageId, emoji, changed }
+      }),
+      removeReaction: vi.fn(async (messageId: string, emoji: string) => ({ messageId, emoji, changed: reactions.get(messageId)?.delete(emoji) ?? false })),
+      listReactionUsers: vi.fn(async () => ({ data: [], nextCursor: null })),
+      onReactionChanged: vi.fn((_id: string, handler: (event: ReactionChangedEvent) => void) => { handlers.reaction = handler; return close() }),
+    } : {}),
     sendTyping: vi.fn().mockResolvedValue(undefined),
     onConnectionEvent: vi.fn(close),
     onInboxChanged: vi.fn(handler => { handlers.inboxChanged = handler; return close() }),
@@ -118,11 +132,36 @@ function client(rows: Message[] = [], participants: Participant[] = [], options:
     read(userId: string, readAt: Date, readPosition: ReadPosition | null = null) { handlers.read!({ userId, readAt, readPosition }) },
     /** An `inbox_changed` signal for the bound user; the refresh it queues has settled once this resolves. */
     async inboxChanged() { handlers.inboxChanged?.(); await flush() },
+    reactionChanged(id: string, conversationId = 'room') { handlers.reaction?.({ id, conversationId }) },
+    setReaction(id: string, emoji: string) { reactions.set(id, new Set([emoji])) },
   }
   return { sdk, targets, acks, clears, live, rows, participants }
 }
 
 describe('UI state', () => {
+  it('refreshes visible reaction summaries on private invalidations and toggles the exact emoji', async () => {
+    vi.useFakeTimers()
+    try {
+      const row = message('reaction-row', 'alex', at(1))
+      const { sdk, live } = client([row], [participant('me'), participant('alex')], { reactions: true })
+      const controller = new ConversationController({ conversationId: 'room', client: sdk, autoLoad: false, markReadOnLoad: false })
+      await controller.loadInitial()
+      await vi.advanceTimersByTimeAsync(30)
+      expect(controller.getSnapshot().canReact).toBe(true)
+      expect(sdk.getReactionSummaries).toHaveBeenCalledWith('room', ['reaction-row'])
+      live.setReaction(row.id, '👍🏽')
+      live.reactionChanged(row.id, 'other-room')
+      await vi.advanceTimersByTimeAsync(30)
+      expect(controller.getSnapshot().reactionSummaries.get(row.id)?.reactions).toEqual([])
+      live.reactionChanged(row.id)
+      await vi.advanceTimersByTimeAsync(30)
+      expect(controller.getSnapshot().reactionSummaries.get(row.id)?.reactions[0]).toEqual({ emoji: '👍🏽', count: 1, reactedByMe: true })
+      expect(await controller.toggleReaction(row.id, '👍🏽')).toBe(true)
+      await vi.advanceTimersByTimeAsync(30)
+      expect(controller.getSnapshot().reactionSummaries.get(row.id)?.reactions).toEqual([])
+      await controller.dispose()
+    } finally { vi.useRealTimers() }
+  })
   it('re-exports the core types the UI surface is typed against', () => {
     const input: EditMessageInput = { text: null, revision: 2 }
     const inbox: ExportedInboxSummary = {

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.0
+
+- Add default-row emoji picker, count chips, and paged reactor list. The controller batches summary reads, refreshes after `reaction_changed` and reconnect, and exposes reaction actions to custom rows. Export `ReactionBar` for those rows.
+
 ## 0.9.0
 
 Quoted replies and jump-to-message. Requires the 0.9 backend and

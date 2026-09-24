@@ -655,3 +655,7 @@ through `useConvoKitTheme`.
 Version 0.9.0 requires `@convokitapp/react-native` 0.9.x (peer
 `>=0.9.0 <0.10.0`). Publish `@convokitapp/react-native` before publishing this
 package.
+
+## Emoji reactions
+
+`ConvoKitConversationView` renders a picker, count chips, and a paged reactor list. Custom rows can use the exported `ReactionBar`. The controller batches visible summaries and refetches after private invalidations or reconnect. Emoji sequences are exact (`👍` differs from `👍🏽`); `READ` members can inspect reactors, while `READ_WRITE` members can toggle their own reaction.
